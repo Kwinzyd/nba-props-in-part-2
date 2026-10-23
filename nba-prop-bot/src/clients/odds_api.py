@@ -77,6 +77,14 @@ class OddsApiClient:
 
         next_key = self._advance_to_available_key()
         if next_key:
+            # Quota reflects the active key, not the exhausted one. Unknown
+            # until the new key's first response, so quota guards don't block
+            # scans on the old key's 0.
+            known = OddsApiClient._key_quotas.get(next_key)
+            self._quota_fetched = known is not None
+            if known:
+                self.requests_used = known['used']
+                self.requests_remaining = known['remaining']
             logger.info(
                 f"Odds API: Automatically failed over to backup key {next_key[:8]}... "
                 f"(Key #{self.current_key_index + 1} of {len(self.api_keys)})"
