@@ -3,11 +3,30 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+ODDS_API_KEYS_RAW = os.getenv("ODDS_API_KEYS", "")
+ODDS_API_KEYS = [k.strip() for k in ODDS_API_KEYS_RAW.split(",") if k.strip()]
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
+if not ODDS_API_KEYS and ODDS_API_KEY:
+    ODDS_API_KEYS = [ODDS_API_KEY]
+elif ODDS_API_KEYS and not ODDS_API_KEY:
+    ODDS_API_KEY = ODDS_API_KEYS[0]
+
+SPORTRADAR_API_KEYS_RAW = os.getenv("SPORTRADAR_API_KEYS", "")
+SPORTRADAR_API_KEYS = [k.strip() for k in SPORTRADAR_API_KEYS_RAW.split(",") if k.strip()]
+SPORTRADAR_API_KEY = os.getenv("SPORTRADAR_API_KEY")
+if not SPORTRADAR_API_KEYS and SPORTRADAR_API_KEY:
+    SPORTRADAR_API_KEYS = [SPORTRADAR_API_KEY]
+elif SPORTRADAR_API_KEYS and not SPORTRADAR_API_KEY:
+    SPORTRADAR_API_KEY = SPORTRADAR_API_KEYS[0]
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 EDGE_MIN = float(os.getenv("EDGE_MIN", "0.05"))
 MIN_PROJECTED_MINUTES = float(os.getenv("MIN_PROJECTED_MINUTES", "15.0"))
+# Skip player props when fewer than this many game logs exist (current season
+# plus the prior-season blend). Only bites on rookies / players with no prior
+# NBA season, whose projections would otherwise rest on 1-2 games.
+MIN_PLAYER_GAMES = int(os.getenv("MIN_PLAYER_GAMES", "3"))
 
 # Playoff overrides. Lines tighten (sharper books, more handle) and rotations
 # compress (bench rarely sees the floor). When scan_props runs with

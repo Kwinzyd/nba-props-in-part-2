@@ -1,7 +1,8 @@
 """
 Multi-season XGBoost training pipeline.
 
-Fetches game logs for all active players across the last N seasons,
+Fetches game logs for all active players across the in-progress season
+plus the last N completed seasons,
 builds the full training dataset, and trains one XGBRegressor per market.
 Existing models are overwritten on success.
 
@@ -10,7 +11,8 @@ Usage:
     TRAIN_SEASONS=2 python -m src.pipelines.train_ml
 
 Environment:
-    TRAIN_SEASONS   number of seasons of data to use (default 3)
+    TRAIN_SEASONS   number of completed seasons to use alongside the
+                    current one (default 3)
     TRAIN_MIN_GP    minimum games played filter (default 20)
 """
 
@@ -18,10 +20,13 @@ import os
 import time
 import pandas as pd
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from src.utils.logging_utils import get_logger
-from src.clients.nba_stats import NbaStatsClient
+from src.clients.nba_stats import (
+    NbaStatsClient, get_current_nba_season, get_completed_seasons, get_current_roster,
+    _normalize_player_name,
+)
 from src.clients.bdl_client import BDLClient
 from src.clients.bdl_game_logs import BDLGameLogs
 from src.data.db import get_db_client
@@ -31,9 +36,57 @@ from src.models.experiment_tracker import training_run
 
 logger = get_logger(__name__)
 
-_DEFAULT_SEASONS = ['2025-26', '2024-25', '2023-24']
 _N_SEASONS       = int(os.getenv('TRAIN_SEASONS', '3'))
 _MIN_GP          = int(os.getenv('TRAIN_MIN_GP',  '20'))
+
+
+def _default_seasons() -> List[str]:
+    """In-progress season first, then the last _N_SEASONS completed ones."""
+    return [get_current_nba_season()] + get_completed_seasons(_N_SEASONS)
+
+
+def _nba_to_bdl_ids(bdl_client: BDLClient) -> Dict[int, Tuple[str, int]]:
+    """
+    Map NBA Stats player ID → (full name, BDL player ID). The two APIs use
+    different ID spaces, so they are bridged on normalized player name.
+    """
+    bdl_by_name: Dict[str, int] = {}
+    bdl_by_last: Dict[str, List[int]] = {}
+    for p in bdl_client.get_active_players():
+        norm = _normalize_player_name(f"{p['first_name']} {p['last_name']}")
+        bdl_by_name[norm] = p['id']
+        if norm:
+            bdl_by_last.setdefault(norm.split()[-1], []).append(p['id'])
+
+    from nba_api.stats.static import players as nba_players
+    nba_id_to_name = {p['id']: p['full_name'] for p in nba_players.get_players()}
+    # Rookies / new signings aren't in the bundled static list
+    roster = get_current_roster()['id_to_name']
+    nba_id_to_name.update(roster)
+
+    mapping: Dict[int, Tuple[str, int]] = {}
+    claimed: set = set()
+    # Current-roster players first, so a retired namesake (suffixes are
+    # normalized away: "Tim Hardaway" / "Tim Hardaway Jr.") never takes an
+    # active player's BDL ID.
+    ordered = sorted(nba_id_to_name.items(), key=lambda kv: kv[0] not in roster)
+    for nba_id, name in ordered:
+        norm = _normalize_player_name(name)
+        if not norm:
+            continue
+        # Exact, then reversed order ("Yang Hansen" / "Hansen Yang")
+        bdl_id = bdl_by_name.get(norm) or bdl_by_name.get(' '.join(reversed(norm.split())))
+        # Nicknames ("Bones Hyland" / "Nah'Shon Hyland"): a unique last name
+        # is safe, but only for players on a current roster so retired
+        # namesakes can't steal an active player's ID.
+        if not bdl_id and nba_id in roster:
+            candidates = bdl_by_last.get(norm.split()[-1], [])
+            if len(candidates) == 1:
+                bdl_id = candidates[0]
+        if bdl_id and bdl_id not in claimed:
+            mapping[nba_id] = (name, bdl_id)
+            claimed.add(bdl_id)
+    return mapping
 
 
 def train_ml_models(seasons: Optional[List[str]] = None) -> dict:
@@ -42,7 +95,7 @@ def train_ml_models(seasons: Optional[List[str]] = None) -> dict:
     Returns {market: success_bool}.
     """
     if seasons is None:
-        seasons = _DEFAULT_SEASONS[:_N_SEASONS]
+        seasons = _default_seasons()
 
     stats = NbaStatsClient()
     bot   = TelegramBotClient()
@@ -71,36 +124,22 @@ def train_ml_models(seasons: Optional[List[str]] = None) -> dict:
     if team_stats_df is not None and not team_stats_df.empty and 'PACE' in team_stats_df.columns:
         league_avg_pace = float(team_stats_df['PACE'].mean())
 
-    # Map names to BDL IDs for efficient cache lookup
     logger.info("Fetching BDL player mapping...")
-    bdl_client = BDLClient()
-    bdl_players = bdl_client.get_active_players()
-    name_to_bdl_id = {
-        f"{p['first_name']} {p['last_name']}".strip().lower(): p['id']
-        for p in bdl_players
-    }
-    
-    # Also get NBA ID -> Name mapping to bridge the two
-    from nba_api.stats.static import players as nba_players
-    nba_id_to_name = {
-        p['id']: p['full_name'].lower()
-        for p in nba_players.get_players() if p['is_active']
-    }
+    id_map = _nba_to_bdl_ids(BDLClient())
 
     # Collect all logs
     player_logs: List[pd.DataFrame] = []
     for idx, pid in enumerate(player_ids):
-        name = nba_id_to_name.get(pid)
-        bdl_id = name_to_bdl_id.get(name) if name else None
-        
-        if not bdl_id:
-            logger.warning(f"Could not find BDL ID for player {name} ({pid}). Skipping.")
+        if pid not in id_map:
+            logger.warning(f"Could not find BDL ID for NBA player {pid}. Skipping.")
             continue
+        _, bdl_id = id_map[pid]
 
         season_dfs = []
         for season in seasons:
             szn_int = int(season.split('-')[0])
-            df = bdl_logs.get_player_game_logs(bdl_id, szn_int, ignore_ttl=True)
+            df = bdl_logs.get_player_game_logs(
+                bdl_id, szn_int, ignore_ttl=(season != stats.season))
             if not df.empty:
                 season_dfs.append(df)
 
@@ -174,7 +213,7 @@ def train_ml_models_clv_feedback(seasons: Optional[List[str]] = None) -> dict:
     when the clv_tracking table has insufficient data.
     """
     if seasons is None:
-        seasons = _DEFAULT_SEASONS[:_N_SEASONS]
+        seasons = _default_seasons()
 
     stats = NbaStatsClient()
     bot   = TelegramBotClient()
@@ -201,20 +240,21 @@ def train_ml_models_clv_feedback(seasons: Optional[List[str]] = None) -> dict:
     if team_stats_df is not None and not team_stats_df.empty and 'PACE' in team_stats_df.columns:
         league_avg_pace = float(team_stats_df['PACE'].mean())
 
+    id_map = _nba_to_bdl_ids(BDLClient())
+
     # Collect (player_name, logs) — name required for CLV lookup
     named_logs: list = []
     for idx, pid in enumerate(player_ids):
-        try:
-            from nba_api.stats.static import players as _nba_players
-            info = _nba_players.find_player_by_id(pid)
-            player_name = info['full_name'] if info else str(pid)
-        except Exception:
-            player_name = str(pid)
+        if pid not in id_map:
+            logger.warning(f"Could not find BDL ID for NBA player {pid}. Skipping.")
+            continue
+        player_name, bdl_id = id_map[pid]
 
         season_dfs = []
         for season in seasons:
             szn_int = int(season.split('-')[0])
-            df = bdl_logs.get_player_game_logs(pid, szn_int, ignore_ttl=True)
+            df = bdl_logs.get_player_game_logs(
+                bdl_id, szn_int, ignore_ttl=(season != stats.season))
             if not df.empty:
                 season_dfs.append(df)
 

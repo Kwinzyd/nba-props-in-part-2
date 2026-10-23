@@ -83,7 +83,11 @@ class TwitterNitterMonitor:
     def _load_player_names() -> Set[str]:
         try:
             from nba_api.stats.static import players
-            return {p['full_name'].lower() for p in players.get_players()}
+            from src.clients.nba_stats import get_current_roster
+            names = {p['full_name'].lower() for p in players.get_players()}
+            # Rookies / new signings aren't in the bundled static list
+            names |= {n.lower() for n in get_current_roster()['id_to_name'].values()}
+            return names
         except Exception:
             return set()
 

@@ -207,6 +207,13 @@ class BDLDefenseContext:
             }
             profiles[key] = profile
 
+        if not profiles and season > 2020:
+            logger.info(
+                f"BDL defense context: 0 team profiles for season {season} "
+                f"(opening night / early season); falling back to {season - 1}"
+            )
+            return self._fetch_all_profiles(season - 1)
+
         logger.info(
             f"BDL defense context: built {len(profiles)} team profiles "
             f"for season {season}"

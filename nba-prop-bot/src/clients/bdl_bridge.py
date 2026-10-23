@@ -452,45 +452,65 @@ class BDLBridge:
         logger.info(f"BDL: Prefetching profiles for {len(needed)} players (season {season})")
         import requests
 
-        # Helper to check for 429 and abort prefetch
+        # Helper to check for 429 and abort prefetch while populating default cache
+        def _abort_rate_limited():
+            for pid in needed:
+                if pid not in self._profile_cache:
+                    self._profile_cache[pid] = self._build_profile_from_data(pid, [], None, {}, None)
+
         def _is_rate_limited(e):
-            return "429" in str(e) or isinstance(e, requests.exceptions.RetryError)
+            if "429" in str(e) or isinstance(e, requests.exceptions.RetryError):
+                _abort_rate_limited()
+                return True
+            return False
+
+        active_season = season
 
         # 1. Advanced stats V2
         adv_by_p = {}
         try:
-            adv_rows = self.bdl.get_advanced_stats(player_ids=needed, seasons=[season], period=0)
+            adv_rows = self.bdl.get_advanced_stats(player_ids=needed, seasons=[active_season], period=0)
             for row in adv_rows:
                 pid = row.get("player_id")
                 if pid:
                     adv_by_p.setdefault(pid, []).append(row)
         except Exception as e:
             logger.warning(f"BDL prefetch: advanced stats failed: {e}")
-            if _is_rate_limited(e): return # Abort prefetch if rate limited
+            if _is_rate_limited(e): return
 
-        time.sleep(1.0) # Grace period
+        time.sleep(0.5)
 
         # 2. General/Advanced
         gen_adv_by_p = {}
         try:
-            gen_adv_rows = self.bdl.get_season_averages(season=season, player_ids=needed, category="general", stat_type="advanced")
+            gen_adv_rows = self.bdl.get_season_averages(season=active_season, player_ids=needed, category="general", stat_type="advanced")
             gen_adv_by_p = {row.get("player_id"): row for row in gen_adv_rows if row.get("player_id")}
         except Exception as e:
             if _is_rate_limited(e): return
 
-        time.sleep(1.0)
+        # Opening night / early season check: if 0 advanced stats found for current season, fallback to prior season
+        if not gen_adv_by_p and not adv_by_p and season > 2020:
+            logger.info(f"BDL: No season stats for season {season} (opening night); falling back to {season - 1}")
+            active_season = season - 1
+            try:
+                gen_adv_rows = self.bdl.get_season_averages(season=active_season, player_ids=needed, category="general", stat_type="advanced")
+                gen_adv_by_p = {row.get("player_id"): row for row in gen_adv_rows if row.get("player_id")}
+            except Exception as e:
+                if _is_rate_limited(e): return
+
+        time.sleep(0.5)
 
         # 3. Playtypes
         playtypes = ["prballhandler", "prrollman", "isolation", "spotup", "transition", "postup"]
         pt_data_by_p = {pid: {} for pid in needed}
         for pt in playtypes:
             try:
-                rows = self.bdl.get_season_averages(season=season, player_ids=needed, category="playtype", stat_type=pt)
+                rows = self.bdl.get_season_averages(season=active_season, player_ids=needed, category="playtype", stat_type=pt)
                 for row in rows:
                     pid = row.get("player_id")
                     if pid in pt_data_by_p:
                         pt_data_by_p[pid][pt] = row
-                time.sleep(0.5) # Breath between playtypes
+                time.sleep(0.3)
             except Exception as e:
                 if _is_rate_limited(e): return
                 continue
@@ -498,7 +518,7 @@ class BDLBridge:
         # 4. Tracking/Drives
         drives_by_p = {}
         try:
-            drives_rows = self.bdl.get_season_averages(season=season, player_ids=needed, category="tracking", stat_type="drives")
+            drives_rows = self.bdl.get_season_averages(season=active_season, player_ids=needed, category="tracking", stat_type="drives")
             drives_by_p = {row.get("player_id"): row for row in drives_rows if row.get("player_id")}
         except Exception as e:
             if _is_rate_limited(e): return

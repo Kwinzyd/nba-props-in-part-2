@@ -2,6 +2,7 @@ import os
 import json
 from datetime import datetime, timezone, timedelta
 from src.clients.sportradar_client import SportradarClient
+from src.clients.nba_stats import get_current_nba_season
 from src.data.db import get_db_client
 from src.utils.logging_utils import get_logger
 
@@ -226,7 +227,7 @@ def sync_synergy_stats():
         if not stats or 'play_types' not in stats:
             continue
             
-        season = stats.get('season', {}).get('year', '2024')
+        season = stats.get('season', {}).get('year', get_current_nba_season().split('-')[0])
         team_name = stats.get('name', 'Unknown')
         
         with db.get_conn() as conn:

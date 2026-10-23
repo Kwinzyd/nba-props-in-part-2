@@ -68,15 +68,13 @@ class RotationModel:
             target_player_id=203076,
             absent_player_ids=[203507],
             logs=target_player_logs_df,
-            season="2024-25",
+            season="2026-27",
             db=db_client,
         )
     """
 
-    # Playoff Adjustments: Reduced GAMES_BACK from 15 to 5 to drop noisy regular
-    # season games. Reduced MIN_GAMES to 3 to activate the model earlier in a series.
-    GAMES_BACK      = 5
-    MIN_GAMES       = 3
+    GAMES_BACK      = 15
+    MIN_GAMES       = 5   # need at least 5 PBP games to trust the model
     NEXT_MAN_THRESHOLD = 0.40  # slot_prob >= 40% = "this is their typical slot"
 
     def __init__(self, nba_client):

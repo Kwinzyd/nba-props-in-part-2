@@ -403,7 +403,37 @@ def settle_alerts(target_date: Optional[str] = None) -> None:
     )
 
 
+def settle_recent(days: int = 4) -> None:
+    """
+    Settle every day in the last `days` (oldest first) that still has
+    unsettled alerts. A single missed 04:00 run — bot down, BDL rate limit,
+    a late West Coast final — would otherwise leave that day ungraded forever.
+    """
+    db = get_db_client()
+    start = (date.today() - timedelta(days=days)).strftime('%Y-%m-%d')
+    yesterday = (date.today() - timedelta(days=1)).strftime('%Y-%m-%d')
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT COALESCE(a.game_date::DATE, a.timestamp::DATE) AS game_date
+            FROM   alerts_sent a
+            LEFT   JOIN bet_results b ON a.id = b.alert_id
+            WHERE  b.alert_id IS NULL
+              AND  COALESCE(a.game_date::DATE, a.timestamp::DATE) BETWEEN %s AND %s
+            ORDER  BY 1
+            """,
+            (start, yesterday),
+        ).fetchall()
+
+    for row in rows:
+        d = row['game_date']
+        settle_alerts(target_date=d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d))
+
+
 if __name__ == "__main__":
     import sys
     _date_arg = sys.argv[1] if len(sys.argv) > 1 else None
-    settle_alerts(target_date=_date_arg)
+    if _date_arg:
+        settle_alerts(target_date=_date_arg)
+    else:
+        settle_recent()

@@ -29,7 +29,7 @@ from src.clients.odds_api import OddsApiClient
 from src.pipelines.sync_events import sync_events
 from src.pipelines.scan_props import scan_props
 from src.pipelines.update_clv import update_clv_lines
-from src.pipelines.settle_results import settle_alerts
+from src.pipelines.settle_results import settle_recent
 from src.pipelines.analytics import generate_analytics
 from src.pipelines.calibration import check_calibration
 from src.pipelines.tune import run_tuning
@@ -270,20 +270,44 @@ def submit_job(job_name: str, func, *args):
     return _pool.submit(_run)
 
 
+_scan_lock = threading.Lock()
+_scan_in_progress = False
+
+
+def _run_guarded_scan(label: str, scan_func):
+    global _scan_in_progress
+    with _scan_lock:
+        if _scan_in_progress:
+            logger.info(f"Scan [{label}] skipped: another scan is already in progress.")
+            return
+        _scan_in_progress = True
+
+    try:
+        scan_func()
+    finally:
+        with _scan_lock:
+            _scan_in_progress = False
+
+
 def _maybe_submit_scan(label: str) -> bool:
     """
-    Submit a scan job with a cooldown guard to prevent duplicate triggers
+    Submit a scan job with a cooldown guard and in-progress lock to prevent duplicate triggers
     (e.g., Redis event fires at the same time as the direct-call path).
-    Returns True if submitted, False if cooldown is active.
+    Returns True if submitted, False if cooldown is active or another scan is running.
     """
     global _last_scan_submit
-    now = time.monotonic()
-    if now - _last_scan_submit < _SCAN_COOLDOWN_SEC:
-        remaining = int(_SCAN_COOLDOWN_SEC - (now - _last_scan_submit))
-        logger.info(f"Scan [{label}] skipped: cooldown active ({remaining}s remaining).")
-        return False
-    _last_scan_submit = now
-    submit_job(f"Scan [{label}]", scan_props)
+    with _scan_lock:
+        if _scan_in_progress:
+            logger.info(f"Scan [{label}] skipped: another scan is currently in progress.")
+            return False
+        now = time.monotonic()
+        if now - _last_scan_submit < _SCAN_COOLDOWN_SEC:
+            remaining = int(_SCAN_COOLDOWN_SEC - (now - _last_scan_submit))
+            logger.info(f"Scan [{label}] skipped: cooldown active ({remaining}s remaining).")
+            return False
+        _last_scan_submit = now
+
+    submit_job(f"Scan [{label}]", _run_guarded_scan, label, scan_props)
     return True
 
 
@@ -357,15 +381,20 @@ def job_scan():
         except Exception as e:
             logger.debug(f"Scan summary message failed: {e}")
 
-    # Use the cooldown logic from _maybe_submit_scan but with our custom wrapper
+    # Use the cooldown logic and in-progress lock
     global _last_scan_submit
-    now = time.monotonic()
-    if now - _last_scan_submit < _SCAN_COOLDOWN_SEC:
-        remaining = int(_SCAN_COOLDOWN_SEC - (now - _last_scan_submit))
-        logger.info(f"Scan [SCHEDULED] skipped: cooldown active ({remaining}s remaining).")
-        return
-    _last_scan_submit = now
-    submit_job("Scan [SCHEDULED]", _run_and_summarise)
+    with _scan_lock:
+        if _scan_in_progress:
+            logger.info("Scan [SCHEDULED] skipped: another scan is currently in progress.")
+            return
+        now = time.monotonic()
+        if now - _last_scan_submit < _SCAN_COOLDOWN_SEC:
+            remaining = int(_SCAN_COOLDOWN_SEC - (now - _last_scan_submit))
+            logger.info(f"Scan [SCHEDULED] skipped: cooldown active ({remaining}s remaining).")
+            return
+        _last_scan_submit = now
+
+    submit_job("Scan [SCHEDULED]", _run_guarded_scan, "SCHEDULED", _run_and_summarise)
 
 
 def job_clv():
@@ -545,7 +574,7 @@ def job_execution_summary():
     logger.info(f"Execution summary: P&L={pnl:.2f}, placed={placed}, win_rate={wr_str}")
 
 
-def job_settle():        notify("Settle",          settle_alerts)
+def job_settle():        notify("Settle",          settle_recent)
 def job_stats():         notify("Stats",            generate_analytics)
 def job_calibration():   notify("Calibration",      check_calibration)
 def job_tune():          notify("Tune",             run_tuning, get_db_client())

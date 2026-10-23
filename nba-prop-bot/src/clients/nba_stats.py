@@ -26,6 +26,86 @@ def get_current_nba_season() -> str:
     return f"{start_year}-{end_suffix}"
 
 
+def get_completed_seasons(n: int) -> list:
+    """The n most recent completed seasons, newest first (e.g. ['2025-26', '2024-25'])."""
+    start_year = int(get_current_nba_season().split('-')[0])
+    return [f"{y}-{str(y + 1)[-2:]}" for y in range(start_year - 1, start_year - 1 - n, -1)]
+
+
+def _normalize_player_name(name: str) -> str:
+    """Lowercase, strip accents/periods and generational suffixes ('Jr.', 'III')."""
+    import unicodedata
+    s = unicodedata.normalize('NFKD', str(name)).encode('ascii', 'ignore').decode()
+    s = s.lower().replace('.', '').replace("'", '').replace('-', ' ')
+    parts = [p for p in s.split() if p not in ('jr', 'sr', 'ii', 'iii', 'iv', 'v')]
+    return ' '.join(parts)
+
+
+# Current-season roster (CommonAllPlayers), refreshed once per day. nba_api's
+# static player list is a snapshot bundled with the package and lags each
+# draft class / signing period, so names it doesn't know resolve against this.
+_ROSTER_CACHE: Dict[str, Any] = {'key': None, 'name_to_id': {}, 'id_to_name': {}}
+
+
+def get_current_roster(season: Optional[str] = None) -> Dict[str, Dict]:
+    """
+    Return {'name_to_id': {normalized_name: id}, 'id_to_name': {id: full_name}}
+    for every player on an NBA roster this season. One API call per day,
+    persisted in stats_cache.db so restarts don't refetch.
+    """
+    season = season or get_current_nba_season()
+    today = datetime.now().strftime('%Y-%m-%d')
+    key = f"{season}:{today}"
+    if _ROSTER_CACHE['key'] == key:
+        return _ROSTER_CACHE
+
+    cache_db = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'stats_cache.db')
+    records = None
+    try:
+        with sqlite3.connect(cache_db) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS roster_cache "
+                "(season TEXT PRIMARY KEY, date_fetched TEXT, data_json TEXT)"
+            )
+            row = conn.execute(
+                "SELECT date_fetched, data_json FROM roster_cache WHERE season = ?", (season,)
+            ).fetchone()
+            if row and row[0] == today:
+                import json
+                records = json.loads(row[1])
+    except Exception as e:
+        logger.debug(f"Roster cache read failed: {e}")
+
+    if records is None:
+        try:
+            from nba_api.stats.endpoints import commonallplayers
+            df = commonallplayers.CommonAllPlayers(
+                is_only_current_season=1, league_id='00', season=season, timeout=30,
+            ).get_data_frames()[0]
+            time.sleep(0.6)
+            records = [
+                {'id': int(r['PERSON_ID']), 'name': str(r['DISPLAY_FIRST_LAST'])}
+                for _, r in df.iterrows()
+            ]
+            if records:
+                import json
+                with sqlite3.connect(cache_db) as conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO roster_cache (season, date_fetched, data_json) VALUES (?, ?, ?)",
+                        (season, today, json.dumps(records)),
+                    )
+            logger.info(f"Loaded {len(records)} players on {season} rosters")
+        except Exception as e:
+            logger.warning(f"Could not fetch current-season roster: {e}")
+            # Keep yesterday's map rather than nothing; retry on the next call.
+            return _ROSTER_CACHE
+
+    _ROSTER_CACHE['key'] = key
+    _ROSTER_CACHE['name_to_id'] = {_normalize_player_name(r['name']): r['id'] for r in records}
+    _ROSTER_CACHE['id_to_name'] = {r['id']: r['name'] for r in records}
+    return _ROSTER_CACHE
+
+
 # Build static team lookup tables once at import time
 try:
     from nba_api.stats.static import teams as _nba_teams
@@ -192,6 +272,14 @@ class NbaStatsClient:
                 )
             """)
 
+    @property
+    def prior_season(self) -> str:
+        try:
+            start_year = int(self.season.split('-')[0])
+            return f"{start_year - 1}-{str(start_year)[-2:]}"
+        except Exception:
+            return "2025-26"
+
     # ------------------------------------------------------------------ #
     #  Player game logs                                                    #
     # ------------------------------------------------------------------ #
@@ -206,7 +294,9 @@ class NbaStatsClient:
             row = cursor.fetchone()
             if row and row[0] == today:
                 import io
-                return pd.read_json(io.StringIO(row[1]))
+                cached_df = pd.read_json(io.StringIO(row[1]))
+                if not cached_df.empty and len(cached_df) >= 5:
+                    return cached_df
 
         logger.info(f"Fetching game logs for player {player_id}")
         logs_rs = playergamelogs.PlayerGameLogs(
@@ -226,14 +316,27 @@ class NbaStatsClient:
         df_po = logs_po.get_data_frames()[0]
 
         df = pd.concat([df_po, df_rs], ignore_index=True)
+
+        # Early season / opening night: when < 5 games played in current season,
+        # blend with prior completed season logs so rolling rates & projections have baseline data
+        if len(df) < 5:
+            try:
+                prior_logs = self.get_player_game_logs_season(player_id, self.prior_season)
+                if not prior_logs.empty:
+                    logger.debug(f"Player {player_id} has {len(df)} games in {self.season}; supplemented with {len(prior_logs)} from {self.prior_season}")
+                    df = pd.concat([df, prior_logs], ignore_index=True)
+            except Exception as e:
+                logger.debug(f"Failed to fetch prior season logs for {player_id}: {e}")
+
         if not df.empty and 'GAME_DATE' in df.columns:
             df = df.sort_values('GAME_DATE', ascending=False).reset_index(drop=True)
 
-        with sqlite3.connect(self.cache_db) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO player_logs_cache (player_id, date_fetched, data_json) VALUES (?, ?, ?)",
-                (player_id, today, df.to_json())
-            )
+        if not df.empty:
+            with sqlite3.connect(self.cache_db) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO player_logs_cache (player_id, date_fetched, data_json) VALUES (?, ?, ?)",
+                    (player_id, today, df.to_json())
+                )
 
         return df
 
@@ -297,19 +400,33 @@ class NbaStatsClient:
         """
         Return list of player IDs for all active players with >= min_gp games
         this season. Used by backtest and train_ml pipelines.
+
+        Early in a season almost nobody has min_gp games yet, so prior-season
+        qualifiers are added until the current season supplies enough players.
         """
-        try:
-            from nba_api.stats.endpoints import leaguedashplayerstats
+        from nba_api.stats.endpoints import leaguedashplayerstats
+
+        def _qualified(season: str) -> list:
             stats = leaguedashplayerstats.LeagueDashPlayerStats(
-                season=self.season,
+                season=season,
                 per_mode_detailed='Totals',
             )
             time.sleep(0.6)
             df = stats.get_data_frames()[0]
             if df.empty or 'GP' not in df.columns:
                 return []
-            qualified = df[df['GP'] >= min_gp]
-            return qualified['PLAYER_ID'].tolist()
+            return df[df['GP'] >= min_gp]['PLAYER_ID'].tolist()
+
+        try:
+            ids = _qualified(self.season)
+            if len(ids) < 200:
+                prior = _qualified(self.prior_season)
+                logger.info(
+                    f"Only {len(ids)} players with {min_gp}+ GP in {self.season}; "
+                    f"adding {self.prior_season} qualifiers ({len(prior)})"
+                )
+                ids = list(dict.fromkeys(ids + prior))
+            return ids
         except Exception as e:
             logger.warning(f"Could not fetch active player list: {e}")
             return []
@@ -331,6 +448,21 @@ class NbaStatsClient:
         )
         time.sleep(0.6)
         df = stats.get_data_frames()[0]
+        if df.empty and season_type == 'Regular Season':
+            logger.info(f"Team advanced stats empty for {self.season} (opening night); falling back to {self.prior_season}")
+            try:
+                prior_stats = leaguedashteamstats.LeagueDashTeamStats(
+                    season=self.prior_season,
+                    season_type_all_star=season_type,
+                    measure_type_detailed_defense='Advanced'
+                )
+                time.sleep(0.6)
+                prior_df = prior_stats.get_data_frames()[0]
+                if not prior_df.empty:
+                    df = prior_df
+            except Exception as e:
+                logger.warning(f"Failed to fetch prior season team stats: {e}")
+
         self._adv_stats_cache[season_type] = df
         return df
 
@@ -378,8 +510,23 @@ class NbaStatsClient:
         )
         time.sleep(0.6)
         df = stats.get_data_frames()[0]
+        if df.empty and season_type == 'Regular Season':
+            logger.info(f"Team defense stats empty for {self.season} (opening night); falling back to {self.prior_season}")
+            try:
+                prior_stats = leaguedashteamstats.LeagueDashTeamStats(
+                    season=self.prior_season,
+                    season_type_all_star=season_type,
+                    measure_type_detailed_defense='Defense',
+                    per_mode_detailed='PerGame',
+                )
+                time.sleep(0.6)
+                prior_df = prior_stats.get_data_frames()[0]
+                if not prior_df.empty:
+                    df = prior_df
+            except Exception as e:
+                logger.warning(f"Failed to fetch prior season team defense stats: {e}")
 
-        if season_type == 'Regular Season':
+        if season_type == 'Regular Season' and not df.empty:
             with sqlite3.connect(self.cache_db) as conn:
                 conn.execute(
                     "INSERT OR REPLACE INTO def_stats_cache (season, date_fetched, data_json) VALUES (?, ?, ?)",
@@ -437,9 +584,12 @@ class NbaStatsClient:
             opp_lower = opp_team_name.lower()
 
             def _match(df: pd.DataFrame):
-                row = df[df['TEAM_NAME'].str.lower() == opp_lower]
+                if df is None or df.empty or 'TEAM_NAME' not in df.columns:
+                    return None
+                team_names = df['TEAM_NAME'].astype(str).str.lower()
+                row = df[team_names == opp_lower]
                 if row.empty:
-                    row = df[df['TEAM_NAME'].str.lower().str.contains(
+                    row = df[team_names.str.contains(
                         opp_lower.split()[-1], na=False)]
                 return row.iloc[0] if not row.empty else None
 
@@ -503,8 +653,23 @@ class NbaStatsClient:
         )
         time.sleep(0.6)
         df = stats.get_data_frames()[0]
+        if df.empty and season_type == 'Regular Season':
+            logger.info(f"Team opponent stats empty for {self.season} (opening night); falling back to {self.prior_season}")
+            try:
+                prior_stats = leaguedashteamstats.LeagueDashTeamStats(
+                    season=self.prior_season,
+                    season_type_all_star=season_type,
+                    measure_type_detailed_defense='Opponent',
+                    per_mode_detailed='PerGame'
+                )
+                time.sleep(0.6)
+                prior_df = prior_stats.get_data_frames()[0]
+                if not prior_df.empty:
+                    df = prior_df
+            except Exception as e:
+                logger.warning(f"Failed to fetch prior season opponent stats: {e}")
 
-        if season_type == 'Regular Season':
+        if season_type == 'Regular Season' and not df.empty:
             with sqlite3.connect(self.cache_db) as conn:
                 conn.execute(
                     "INSERT OR REPLACE INTO opp_stats_cache (season, date_fetched, data_json) VALUES (?, ?, ?)",
@@ -543,6 +708,19 @@ class NbaStatsClient:
         )
         time.sleep(0.6)
         df = stats.get_data_frames()[0]
+        if df.empty:
+            logger.info(f"Player season stats empty for {self.season} (opening night); falling back to {self.prior_season}")
+            try:
+                prior_stats = leaguedashplayerstats.LeagueDashPlayerStats(
+                    season=self.prior_season,
+                    per_mode_detailed='PerGame',
+                )
+                time.sleep(0.6)
+                prior_df = prior_stats.get_data_frames()[0]
+                if not prior_df.empty:
+                    df = prior_df
+            except Exception as e:
+                logger.warning(f"Failed to fetch prior season player season stats: {e}")
         self._player_season_cache = df
         return df
 
@@ -818,8 +996,9 @@ class NbaStatsClient:
     @staticmethod
     def resolve_player_id(player_name: str) -> Optional[int]:
         """
-        Return the NBA Stats player ID for a player name using the static
-        players lookup (no API call, no rate limiting needed).
+        Return the NBA Stats player ID for a player name. Tries the static
+        players lookup first (no API call), then the current-season roster
+        so rookies and new signings missing from the bundled list resolve.
         Returns None if the name cannot be resolved.
         """
         try:
@@ -829,7 +1008,8 @@ class NbaStatsClient:
                 return int(matches[0]['id'])
         except Exception:
             pass
-        return None
+        pid = get_current_roster()['name_to_id'].get(_normalize_player_name(player_name))
+        return int(pid) if pid else None
 
     @retry_with_backoff(retries=3, backoff_in_seconds=2)
     def get_player_info(self, player_id: int) -> Dict[str, Any]:

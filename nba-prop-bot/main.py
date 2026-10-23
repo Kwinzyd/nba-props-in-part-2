@@ -54,8 +54,8 @@ def main():
         start_scheduler()
     elif args.command == "full_run":
         print("--- Running Settlement ---")
-        from src.pipelines.settle_results import settle_alerts
-        settle_alerts()
+        from src.pipelines.settle_results import settle_recent
+        settle_recent()
         
         print("--- Running Calibration ---")
         from src.pipelines.calibration import check_calibration
@@ -72,8 +72,8 @@ def main():
         from src.pipelines.update_clv import update_clv_lines
         update_clv_lines()
     elif args.command == "settle":
-        from src.pipelines.settle_results import settle_alerts
-        settle_alerts()
+        from src.pipelines.settle_results import settle_recent
+        settle_recent()
     elif args.command == "stats":
         from src.pipelines.analytics import generate_analytics
         generate_analytics(since=args.since)

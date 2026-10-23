@@ -47,6 +47,7 @@ from src.config import (
     CONSENSUS_BOOKS, CONSENSUS_HOLD_MAX,
     BDL_ENABLED, BDL_PROP_VENDORS,
     ELIMINATION_MODE, ELIMINATION_EDGE_BUMP,
+    MIN_PLAYER_GAMES,
 )
 
 # Elimination games: bump every floor; 0.0 keeps regular behaviour.
@@ -1634,11 +1635,10 @@ def scan_props():
                 # Fallback to nba_api
                 if cache_key not in _PROJECTIONS_CACHE:
                     try:
-                        from nba_api.stats.static import players as nba_players
-                        found = nba_players.find_players_by_full_name(player_name)
-                        if not found:
+                        player_id = NbaStatsClient.resolve_player_id(player_name)
+                        if not player_id:
+                            logger.debug(f"Could not resolve NBA player ID for {player_name!r}")
                             continue
-                        player_id = found[0]['id']
                         logs = stats_client.get_player_game_logs(player_id)
                         time.sleep(0.6)
                         _PROJECTIONS_CACHE[cache_key] = {"logs": logs, "pid": player_id}
@@ -1648,6 +1648,10 @@ def scan_props():
             p_data        = _PROJECTIONS_CACHE[cache_key]
             logs          = p_data["logs"]
             player_id_int = p_data.get("pid")
+
+            if len(logs) < MIN_PLAYER_GAMES:
+                logger.debug(f"{player_name}: only {len(logs)} game log(s) — too thin to project, skipping")
+                continue
 
             # Home/away + rest days
             player_team_abbr = logs.iloc[0]['TEAM_ABBREVIATION'] if not logs.empty else None
