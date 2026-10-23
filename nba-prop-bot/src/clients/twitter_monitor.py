@@ -16,6 +16,7 @@ import random
 from datetime import datetime
 from typing import List, Dict, Set, Optional
 from src.utils.logging_utils import get_logger
+from src.clients.news_monitor import mentions, find_players
 
 logger = get_logger(__name__)
 
@@ -155,11 +156,10 @@ class TwitterNitterMonitor:
     @staticmethod
     def _is_injury_related(text: str) -> bool:
         text_lower = text.lower()
-        return any(kw in text_lower for kw in INJURY_KEYWORDS)
+        return any(mentions(text_lower, kw) for kw in INJURY_KEYWORDS)
 
     def _extract_players(self, text: str) -> List[str]:
-        text_lower = text.lower()
-        return [name for name in self._player_names if name in text_lower]
+        return find_players(text.lower(), self._player_names)
 
     def _process_entry(
         self,
@@ -182,6 +182,8 @@ class TwitterNitterMonitor:
             return None
 
         players_found = self._extract_players(combined)
+        if not players_found:
+            return None     # injury words but no NBA player named
         return {
             'player_name':  players_found[0].title() if players_found else '',
             'all_players':  [p.title() for p in players_found],

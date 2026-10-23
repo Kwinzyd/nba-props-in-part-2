@@ -667,7 +667,7 @@ def start_scheduler():
     schedule.every(120).minutes.do(job_clv)                     # ~11 credits each
     schedule.every(20).minutes.do(job_steam)                    # 0 credits (DB only)
     schedule.every(30).minutes.do(job_exchange_arb)             # 0 credits (Kalshi API, no-op when key unset)
-    schedule.every(5).minutes.do(job_game_arb)                  # 0 credits (Kalshi game markets, no-op when key unset)
+    schedule.every(5).minutes.do(job_game_arb)                  # ~1 Odds API credit/game per GAME_ARB_ODDS_TTL_MIN (sharp ML cache)
     schedule.every(TWITTER_POLL_INTERVAL).seconds.do(job_breaking_news)  # 0 credits (Nitter)
     # Injury feed: free (BDL/scrape). Run frequently — late scratches move minutes hard.
     schedule.every(15).minutes.do(unless_hibernating(job_sync_injuries, "Sync Injuries"))

@@ -9,6 +9,7 @@ from nba_api.stats.endpoints import (
     commonplayerinfo, boxscoretraditionalv2
 )
 from src.utils.retry import retry_with_backoff
+from src.config import TEAM_PRIOR_GAMES
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -280,6 +281,55 @@ class NbaStatsClient:
         except Exception:
             return "2025-26"
 
+    def _blend_prior_team_stats(self, df: pd.DataFrame, **endpoint_kwargs) -> pd.DataFrame:
+        """
+        Shrink early-season team stats toward last season's, per team:
+        current weight = GP / (GP + TEAM_PRIOR_GAMES). One game of data
+        (an 82 offensive rating after one bad night) otherwise drives game
+        markets and opponent adjustments to absurd extremes. Rank columns
+        keep their current-season values; returns df unchanged on failure.
+        """
+        try:
+            prior = leaguedashteamstats.LeagueDashTeamStats(
+                season=self.prior_season,
+                season_type_all_star='Regular Season',
+                **endpoint_kwargs,
+            ).get_data_frames()[0]
+            time.sleep(0.6)
+        except Exception as e:
+            logger.warning(f"Prior-season team stats fetch failed ({self.prior_season}): {e}")
+            return df
+        if prior.empty:
+            return df
+        if df.empty:
+            logger.info(f"No {self.season} team stats yet; using {self.prior_season}")
+            return prior
+        if 'TEAM_ID' not in df.columns or 'GP' not in df.columns:
+            return df
+
+        k = TEAM_PRIOR_GAMES
+        prior_idx = prior.set_index('TEAM_ID')
+        skip = {'TEAM_ID', 'GP', 'W', 'L', 'MIN'}
+        cols = [
+            c for c in df.columns
+            if c not in skip and not c.endswith('_RANK') and c in prior_idx.columns
+            and pd.api.types.is_numeric_dtype(df[c]) and pd.api.types.is_numeric_dtype(prior_idx[c])
+        ]
+        out = df.copy()
+        out[cols] = out[cols].astype(float)
+        for i, row in out.iterrows():
+            tid = row['TEAM_ID']
+            if tid not in prior_idx.index:
+                continue
+            w = float(row['GP']) / (float(row['GP']) + k)
+            for c in cols:
+                out.at[i, c] = w * float(row[c]) + (1.0 - w) * float(prior_idx.at[tid, c])
+        logger.info(
+            f"Team stats ({endpoint_kwargs.get('measure_type_detailed_defense')}): blended "
+            f"{self.season} with {self.prior_season} (prior weight {k} games)"
+        )
+        return out
+
     # ------------------------------------------------------------------ #
     #  Player game logs                                                    #
     # ------------------------------------------------------------------ #
@@ -448,20 +498,8 @@ class NbaStatsClient:
         )
         time.sleep(0.6)
         df = stats.get_data_frames()[0]
-        if df.empty and season_type == 'Regular Season':
-            logger.info(f"Team advanced stats empty for {self.season} (opening night); falling back to {self.prior_season}")
-            try:
-                prior_stats = leaguedashteamstats.LeagueDashTeamStats(
-                    season=self.prior_season,
-                    season_type_all_star=season_type,
-                    measure_type_detailed_defense='Advanced'
-                )
-                time.sleep(0.6)
-                prior_df = prior_stats.get_data_frames()[0]
-                if not prior_df.empty:
-                    df = prior_df
-            except Exception as e:
-                logger.warning(f"Failed to fetch prior season team stats: {e}")
+        if season_type == 'Regular Season':
+            df = self._blend_prior_team_stats(df, measure_type_detailed_defense='Advanced')
 
         self._adv_stats_cache[season_type] = df
         return df
@@ -510,21 +548,9 @@ class NbaStatsClient:
         )
         time.sleep(0.6)
         df = stats.get_data_frames()[0]
-        if df.empty and season_type == 'Regular Season':
-            logger.info(f"Team defense stats empty for {self.season} (opening night); falling back to {self.prior_season}")
-            try:
-                prior_stats = leaguedashteamstats.LeagueDashTeamStats(
-                    season=self.prior_season,
-                    season_type_all_star=season_type,
-                    measure_type_detailed_defense='Defense',
-                    per_mode_detailed='PerGame',
-                )
-                time.sleep(0.6)
-                prior_df = prior_stats.get_data_frames()[0]
-                if not prior_df.empty:
-                    df = prior_df
-            except Exception as e:
-                logger.warning(f"Failed to fetch prior season team defense stats: {e}")
+        if season_type == 'Regular Season':
+            df = self._blend_prior_team_stats(
+                df, measure_type_detailed_defense='Defense', per_mode_detailed='PerGame')
 
         if season_type == 'Regular Season' and not df.empty:
             with sqlite3.connect(self.cache_db) as conn:
@@ -653,21 +679,9 @@ class NbaStatsClient:
         )
         time.sleep(0.6)
         df = stats.get_data_frames()[0]
-        if df.empty and season_type == 'Regular Season':
-            logger.info(f"Team opponent stats empty for {self.season} (opening night); falling back to {self.prior_season}")
-            try:
-                prior_stats = leaguedashteamstats.LeagueDashTeamStats(
-                    season=self.prior_season,
-                    season_type_all_star=season_type,
-                    measure_type_detailed_defense='Opponent',
-                    per_mode_detailed='PerGame'
-                )
-                time.sleep(0.6)
-                prior_df = prior_stats.get_data_frames()[0]
-                if not prior_df.empty:
-                    df = prior_df
-            except Exception as e:
-                logger.warning(f"Failed to fetch prior season opponent stats: {e}")
+        if season_type == 'Regular Season':
+            df = self._blend_prior_team_stats(
+                df, measure_type_detailed_defense='Opponent', per_mode_detailed='PerGame')
 
         if season_type == 'Regular Season' and not df.empty:
             with sqlite3.connect(self.cache_db) as conn:

@@ -27,6 +27,9 @@ MIN_PROJECTED_MINUTES = float(os.getenv("MIN_PROJECTED_MINUTES", "15.0"))
 # plus the prior-season blend). Only bites on rookies / players with no prior
 # NBA season, whose projections would otherwise rest on 1-2 games.
 MIN_PLAYER_GAMES = int(os.getenv("MIN_PLAYER_GAMES", "3"))
+# Early-season team stats are shrunk toward last season's: current-season
+# weight = GP / (GP + TEAM_PRIOR_GAMES). 15 → 1 GP is 6% current, 15 GP 50%.
+TEAM_PRIOR_GAMES = float(os.getenv("TEAM_PRIOR_GAMES", "15"))
 
 # Playoff overrides. Lines tighten (sharper books, more handle) and rotations
 # compress (bench rarely sees the floor). When scan_props runs with
