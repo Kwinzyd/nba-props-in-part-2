@@ -63,6 +63,10 @@ from src.pipelines.sync_sportradar import sync_sportradar_schedule, sync_sportra
 _WATCHDOG_TIMEOUT_SEC = int(os.getenv('WATCHDOG_TIMEOUT_SEC', '300'))  # 5 min default
 # Minimum seconds between scan submissions to prevent duplicate triggers.
 _SCAN_COOLDOWN_SEC = int(os.getenv('SCAN_COOLDOWN_SEC', '60'))
+# News-triggered scans (breaking news, late scratches, injury events) at most
+# this often. Each one re-buys sharp odds (~20 credits per game in the 4h
+# window); a burst of injury news on Oct 23 fired three within 15 minutes.
+_EVENT_SCAN_COOLDOWN_SEC = int(os.getenv('EVENT_SCAN_COOLDOWN_MIN', '20')) * 60
 
 logger = get_logger(__name__)
 bot    = TelegramBotClient()
@@ -87,6 +91,8 @@ ET = tz.gettz('America/New_York')
 _last_tick: float = 0.0
 # Monotonic timestamp of the last scan submission — used by cooldown guard.
 _last_scan_submit: float = 0.0
+# Same, for news-triggered scans only (_EVENT_SCAN_COOLDOWN_SEC).
+_last_event_scan_submit: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +301,7 @@ def _maybe_submit_scan(label: str) -> bool:
     (e.g., Redis event fires at the same time as the direct-call path).
     Returns True if submitted, False if cooldown is active or another scan is running.
     """
-    global _last_scan_submit
+    global _last_scan_submit, _last_event_scan_submit
     with _scan_lock:
         if _scan_in_progress:
             logger.info(f"Scan [{label}] skipped: another scan is currently in progress.")
@@ -305,7 +311,14 @@ def _maybe_submit_scan(label: str) -> bool:
             remaining = int(_SCAN_COOLDOWN_SEC - (now - _last_scan_submit))
             logger.info(f"Scan [{label}] skipped: cooldown active ({remaining}s remaining).")
             return False
+        is_event = label != 'STARTUP'
+        if is_event and now - _last_event_scan_submit < _EVENT_SCAN_COOLDOWN_SEC:
+            remaining = int(_EVENT_SCAN_COOLDOWN_SEC - (now - _last_event_scan_submit))
+            logger.info(f"Scan [{label}] skipped: news-scan cooldown active ({remaining // 60}m remaining).")
+            return False
         _last_scan_submit = now
+        if is_event:
+            _last_event_scan_submit = now
 
     submit_job(f"Scan [{label}]", _run_guarded_scan, label, scan_props)
     return True

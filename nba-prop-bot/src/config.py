@@ -30,6 +30,10 @@ MIN_PLAYER_GAMES = int(os.getenv("MIN_PLAYER_GAMES", "3"))
 # Early-season team stats are shrunk toward last season's: current-season
 # weight = GP / (GP + TEAM_PRIOR_GAMES). 15 → 1 GP is 6% current, 15 GP 50%.
 TEAM_PRIOR_GAMES = float(os.getenv("TEAM_PRIOR_GAMES", "15"))
+# Game-market alerts (moneyline / spread / totals / Q1 / H1 / team totals).
+# Off by default: the team-level model is overconfident against sharp lines
+# (every market on every game flagged at 5-50% "edges" in Oct 2026).
+GAME_MARKETS_ENABLED = os.getenv("GAME_MARKETS_ENABLED", "false").lower() in ("true", "1", "yes")
 
 # Playoff overrides. Lines tighten (sharper books, more handle) and rotations
 # compress (bench rarely sees the floor). When scan_props runs with

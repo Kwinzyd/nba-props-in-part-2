@@ -47,7 +47,7 @@ from src.config import (
     CONSENSUS_BOOKS, CONSENSUS_HOLD_MAX,
     BDL_ENABLED, BDL_PROP_VENDORS,
     ELIMINATION_MODE, ELIMINATION_EDGE_BUMP,
-    MIN_PLAYER_GAMES,
+    MIN_PLAYER_GAMES, BANKROLL,
 )
 
 # Elimination games: bump every floor; 0.0 keeps regular behaviour.
@@ -809,7 +809,14 @@ def scan_props():
 
     candidates = []
 
+    # Alerts go out as each game finishes scanning so early tip-offs aren't
+    # held behind the whole slate. Each game gets a fair share of the daily
+    # budget here; the end-of-scan pass hands leftover budget to the best
+    # remaining edges across all games.
+    _game_risk_share = BANKROLL / max(len(today_events), 1)
+
     for event in today_events:
+        _game_cand_start = len(candidates)
         # ── Resolve game identifiers ──────────────────────────────────
         if BDL_ENABLED_RUNTIME:
             bdl_game_id = event.get("bdl_game_id")
@@ -2204,17 +2211,25 @@ def scan_props():
         except Exception as e:
             logger.warning(f"Failed to build cross-team correlation matrix for {home_team} vs {away_team}: {e}")
 
+        # ── Per-game alerts ───────────────────────────────────────────
+        _game_cands = calibrate_candidates(candidates[_game_cand_start:], playoff_mode=PLAYOFF_MODE)
+        _game_actionable = _actionable_edges(_game_cands)
+        if _game_actionable:
+            logger.info(f"{away_team} @ {home_team}: {len(_game_actionable)} actionable edge(s) — alerting now")
+        for edge in _game_actionable:
+            evaluate_and_alert(edge, db, bot, game_risk_cap=_game_risk_share)
+
     # ── Rank and alert ────────────────────────────────────────────────
-    candidates = calibrate_candidates(candidates, playoff_mode=PLAYOFF_MODE)
-    ranked_edges = rank_edges(candidates)
-    _edge_min_floor = (PLAYOFF_EDGE_MIN if PLAYOFF_MODE else EDGE_MIN) + _ELIM_BUMP
-    actionable = [e for e in ranked_edges if e.get('edge', 0) >= e.get('edge_min_applied', _edge_min_floor)]
+    # Games that exited the loop early were never calibrated above.
+    calibrate_candidates([c for c in candidates if not c.get('calibrated')], playoff_mode=PLAYOFF_MODE)
+    actionable = _actionable_edges(candidates)
 
     logger.info(
         f"Scan complete: {len(candidates)} candidates, {len(actionable)} actionable edges. "
         f"{'[BDL+Sharp mode]' if BDL_ENABLED_RUNTIME else '[Odds API mode]'}"
     )
 
+    # Already-sent alerts are skipped as duplicates; this spends leftover budget.
     for edge in actionable:
         evaluate_and_alert(edge, db, bot)
 
@@ -2224,6 +2239,12 @@ def scan_props():
 
     if BDL_ENABLED_RUNTIME and _bdl_bridge:
         logger.info(f"BDL requests this scan: {_bdl_bridge.bdl.requests_made}")
+
+
+def _actionable_edges(cands: list) -> list:
+    """Rank candidates (idempotent) and keep those clearing their edge floor."""
+    _edge_min_floor = (PLAYOFF_EDGE_MIN if PLAYOFF_MODE else EDGE_MIN) + _ELIM_BUMP
+    return [e for e in rank_edges(cands) if e.get('edge', 0) >= e.get('edge_min_applied', _edge_min_floor)]
 
 
 if __name__ == "__main__":
