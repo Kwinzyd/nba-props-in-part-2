@@ -10,3 +10,8 @@ backups/
 deploy/
 out.txt
 scratch/
+
+# Regenerated nightly by train_calibration
+src/models/calibration_market.json
+# full_run.bat output
+logs/

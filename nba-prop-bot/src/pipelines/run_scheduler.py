@@ -41,7 +41,7 @@ from src.pipelines.timing_analysis import analyze_timing
 from src.clients.twitter_monitor import TwitterNitterMonitor
 from src.pipelines.breaking_news import check_breaking_news
 from src.pipelines.train_ml import train_ml_models, train_ml_models_clv_feedback
-from src.pipelines.train_calibration import train_isotonic_calibration
+from src.pipelines.train_calibration import train_market_anchored_calibration
 from src.pipelines.flush_alerts import flush_pending_alerts
 from src.pipelines.drift_monitor import check_drift
 from src.models.edge_ranker import reload_clv_thresholds
@@ -538,7 +538,7 @@ def job_drift_monitor():
 
     if result.get('alarm'):
         logger.warning("Drift ALARM — triggering immediate retrain.")
-        notify("Train Calibration [drift alarm]", train_isotonic_calibration)
+        notify("Train Calibration [drift alarm]", train_market_anchored_calibration)
         reload_calibration_model()
         notify("Train ML [drift alarm]", train_ml_models)
 
@@ -597,7 +597,7 @@ def job_timing_analysis(): notify("Timing Analysis", analyze_timing)
 def job_train_ml():      notify("Train ML",                  train_ml_models)
 def job_train_clv_ml():  notify("Train ML [CLV Feedback]",   train_ml_models_clv_feedback)
 def job_train_calibration():
-    notify("Train Calibration", train_isotonic_calibration)
+    notify("Train Calibration", train_market_anchored_calibration)
     ok = reload_calibration_model()
     logger.info(f"Calibration model hot-reloaded: {'OK' if ok else 'no model on disk'}")
 

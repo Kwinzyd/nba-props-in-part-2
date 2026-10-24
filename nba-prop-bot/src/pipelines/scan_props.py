@@ -47,7 +47,7 @@ from src.config import (
     CONSENSUS_BOOKS, CONSENSUS_HOLD_MAX,
     BDL_ENABLED, BDL_PROP_VENDORS,
     ELIMINATION_MODE, ELIMINATION_EDGE_BUMP,
-    MIN_PLAYER_GAMES, BANKROLL,
+    MIN_PLAYER_GAMES, BANKROLL, ALERT_LEAD_HOURS,
 )
 
 # Elimination games: bump every floor; 0.0 keeps regular behaviour.
@@ -2242,9 +2242,16 @@ def scan_props():
 
 
 def _actionable_edges(cands: list) -> list:
-    """Rank candidates (idempotent) and keep those clearing their edge floor."""
+    """
+    Rank candidates (idempotent) and keep those clearing their edge floor
+    whose game tips within ALERT_LEAD_HOURS (later scans pick up the rest).
+    """
     _edge_min_floor = (PLAYOFF_EDGE_MIN if PLAYOFF_MODE else EDGE_MIN) + _ELIM_BUMP
-    return [e for e in rank_edges(cands) if e.get('edge', 0) >= e.get('edge_min_applied', _edge_min_floor)]
+    return [
+        e for e in rank_edges(cands)
+        if e.get('edge', 0) >= e.get('edge_min_applied', _edge_min_floor)
+        and e.get('hours_to_tipoff', 0.0) <= ALERT_LEAD_HOURS
+    ]
 
 
 if __name__ == "__main__":

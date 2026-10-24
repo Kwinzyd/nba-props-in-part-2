@@ -34,6 +34,11 @@ TEAM_PRIOR_GAMES = float(os.getenv("TEAM_PRIOR_GAMES", "15"))
 # Off by default: the team-level model is overconfident against sharp lines
 # (every market on every game flagged at 5-50% "edges" in Oct 2026).
 GAME_MARKETS_ENABLED = os.getenv("GAME_MARKETS_ENABLED", "false").lower() in ("true", "1", "yes")
+# Props alert only once their game is within this many hours of tip-off, so
+# the day's budget isn't spent on the first morning scan before lineup and
+# injury news. Keep it above SCAN_INTERVAL_MINUTES so every game gets a scan
+# inside the window.
+ALERT_LEAD_HOURS = float(os.getenv("ALERT_LEAD_HOURS", "3"))
 
 # Playoff overrides. Lines tighten (sharper books, more handle) and rotations
 # compress (bench rarely sees the floor). When scan_props runs with

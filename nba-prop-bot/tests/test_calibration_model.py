@@ -52,3 +52,46 @@ def test_boundary_values():
     assert calibrate_prob(1.0) <= 1.0
     assert 0.0 < calibrate_prob(0.01) < 1.0
     assert 0.0 < calibrate_prob(0.99) <= 1.0
+
+
+# ── Market-anchored calibration ──────────────────────────────────────────────
+
+import src.models.calibration_model as _cm
+
+_PARAMS = {'k': 0.0, 'b_under': 0.45}
+
+
+def _with_anchor(monkeypatch, params=_PARAMS):
+    monkeypatch.setattr(_cm, '_get_anchor', lambda: params)
+
+
+def test_anchored_over_with_k0_returns_market_price():
+    assert abs(_cm.anchored_prob(0.80, 0.55, False, _PARAMS) - 0.55) < 1e-9
+
+
+def test_anchored_under_bias_raises_prob():
+    p = _cm.anchored_prob(0.80, 0.55, True, _PARAMS)
+    assert 0.64 < p < 0.68, p
+
+
+def test_anchored_k1_returns_raw():
+    assert abs(_cm.anchored_prob(0.70, 0.50, False, {'k': 1.0, 'b_under': 0.0}) - 0.70) < 1e-9
+
+
+def test_candidate_uses_book_odds_and_side(monkeypatch):
+    _with_anchor(monkeypatch)
+    c = calibrate_edge_candidate({'model_prob': 0.80, 'odds': 1.80, 'side': 'UNDER'})
+    assert c['raw_model_prob'] == 0.80
+    assert abs(c['model_prob'] - _cm.anchored_prob(0.80, 1 / 1.80, True, _PARAMS)) < 1e-9
+
+
+def test_candidate_below_min_raw_edge_gets_no_edge(monkeypatch):
+    _with_anchor(monkeypatch)
+    implied = 1 / 1.80
+    c = calibrate_edge_candidate({'model_prob': implied + 0.01, 'odds': 1.80, 'side': 'UNDER'})
+    assert abs(c['model_prob'] - implied) < 1e-9
+
+
+def test_no_odds_falls_back_to_legacy(monkeypatch):
+    _with_anchor(monkeypatch)
+    assert calibrate_prob(0.6) == _cm.calibrate_prob(0.6, implied=None)
