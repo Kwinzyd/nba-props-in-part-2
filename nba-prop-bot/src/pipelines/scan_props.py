@@ -47,7 +47,7 @@ from src.config import (
     CONSENSUS_BOOKS, CONSENSUS_HOLD_MAX,
     BDL_ENABLED, BDL_PROP_VENDORS,
     ELIMINATION_MODE, ELIMINATION_EDGE_BUMP,
-    MIN_PLAYER_GAMES, BANKROLL, ALERT_LEAD_HOURS,
+    MIN_PLAYER_GAMES, BANKROLL, ALERT_LEAD_HOURS, DAILY_RISK_PCT,
 )
 
 # Elimination games: bump every floor; 0.0 keeps regular behaviour.
@@ -810,10 +810,16 @@ def scan_props():
     candidates = []
 
     # Alerts go out as each game finishes scanning so early tip-offs aren't
-    # held behind the whole slate. Each game gets a fair share of the daily
-    # budget here; the end-of-scan pass hands leftover budget to the best
-    # remaining edges across all games.
-    _game_risk_share = BANKROLL / max(len(today_events), 1)
+    # held behind the whole slate. Each game yet to tip gets a fair share of
+    # the daily budget here; the end-of-scan pass hands leftover budget to the
+    # best remaining edges, minus the shares reserved for games that haven't
+    # entered their ALERT_LEAD_HOURS window yet (so a 7pm slate can't spend
+    # the 10pm games' budget).
+    _daily_budget = BANKROLL * DAILY_RISK_PCT
+    _hours_left = [_hours_until(e.get('commence_time', '')) for e in today_events]
+    _hours_left = [h for h in _hours_left if h is None or h > 0]
+    _game_risk_share = _daily_budget / max(len(_hours_left), 1)
+    _reserved = _game_risk_share * sum(1 for h in _hours_left if h is not None and h > ALERT_LEAD_HOURS)
 
     for event in today_events:
         _game_cand_start = len(candidates)
@@ -2231,7 +2237,7 @@ def scan_props():
 
     # Already-sent alerts are skipped as duplicates; this spends leftover budget.
     for edge in actionable:
-        evaluate_and_alert(edge, db, bot)
+        evaluate_and_alert(edge, db, bot, daily_risk_cap=_daily_budget - _reserved)
 
     generate_and_alert_combos(actionable, bot, db=db, playoff_mode=PLAYOFF_MODE)
     generate_four_leg_parlays(actionable, bot, db=db, playoff_mode=PLAYOFF_MODE)
@@ -2239,6 +2245,19 @@ def scan_props():
 
     if BDL_ENABLED_RUNTIME and _bdl_bridge:
         logger.info(f"BDL requests this scan: {_bdl_bridge.bdl.requests_made}")
+
+
+def _hours_until(commence_str: str) -> Optional[float]:
+    """Hours from now until an ISO tip-off time (negative once tipped); None if unparseable."""
+    if not commence_str:
+        return None
+    try:
+        dt = dateutil.parser.isoparse(commence_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (dt - datetime.now(timezone.utc)).total_seconds() / 3600.0
+    except Exception:
+        return None
 
 
 def _actionable_edges(cands: list) -> list:

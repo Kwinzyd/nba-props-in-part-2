@@ -80,6 +80,11 @@ DB_PATH = os.getenv("DB_PATH", "props.db")
 # Run Risk Management
 BANKROLL = float(os.getenv("BANKROLL", "1000.0"))
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
+# Risk limits as fractions of BANKROLL. Daily and per-game totals are summed
+# over alerts in the last 12 hours.
+DAILY_RISK_PCT = float(os.getenv("DAILY_RISK_PCT", "0.25"))
+GAME_RISK_PCT  = float(os.getenv("GAME_RISK_PCT",  "0.10"))
+MAX_BET_PCT    = float(os.getenv("MAX_BET_PCT",    "0.025"))
 
 # Scheduler credit-conservation settings
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "45"))

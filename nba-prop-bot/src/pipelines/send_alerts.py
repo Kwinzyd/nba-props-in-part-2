@@ -4,7 +4,10 @@ from src.utils.logging_utils import get_logger
 from src.clients.telegram_bot import TelegramBotClient
 from src.data.db import DatabaseClient, get_db_client
 from src.clients.sportradar_client import SportradarClient
-from src.config import BANKROLL, KELLY_FRACTION, ELIMINATION_MODE, ELIMINATION_KELLY_MULT, GAME_MARKETS_ENABLED
+from src.config import (
+    BANKROLL, KELLY_FRACTION, ELIMINATION_MODE, ELIMINATION_KELLY_MULT, GAME_MARKETS_ENABLED,
+    DAILY_RISK_PCT, GAME_RISK_PCT, MAX_BET_PCT,
+)
 from src.execution.executor import record_execution
 
 logger = get_logger(__name__)
@@ -68,9 +71,11 @@ def _camouflage_stake(stake: float) -> float:
 
 
 def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: TelegramBotClient,
-                       game_risk_cap: Optional[float] = None):
-    """game_risk_cap: tighter per-game risk ceiling for this call (the scan's
-    per-game fair share); Kelly sizing still scales against MAX_PER_GAME."""
+                       game_risk_cap: Optional[float] = None,
+                       daily_risk_cap: Optional[float] = None):
+    """game_risk_cap / daily_risk_cap: tighter ceilings for this call (the
+    scan's per-game fair share, and the daily budget minus shares reserved
+    for later games); Kelly sizing still scales against MAX_PER_GAME."""
     player    = edge_data.get('player_id', 'Unknown')
     market    = edge_data.get('market',    'Unknown')
     line      = edge_data.get('line',      0.0)
@@ -92,8 +97,8 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
     home = edge_data.get('home_team', 'Home')
     away = edge_data.get('away_team', 'Away')
 
-    MAX_DAILY_RISK = BANKROLL * 1.00
-    MAX_PER_GAME   = BANKROLL * 0.40
+    MAX_DAILY_RISK = BANKROLL * DAILY_RISK_PCT
+    MAX_PER_GAME   = BANKROLL * GAME_RISK_PCT
 
     current_daily_risk = 0.0
     current_game_risk = 0.0
@@ -138,7 +143,7 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
     stake = 0.0
     if odds > 1 and ev > 0:
         stake = BANKROLL * (ev / (odds - 1.0)) * dynamic_kelly
-        stake = min(stake, BANKROLL * 0.05)  # hard cap: 5% per bet
+        stake = min(stake, BANKROLL * MAX_BET_PCT)  # hard cap per bet
     stake = _camouflage_stake(stake)
 
     # ── Final Risk Guard & Persist ────────────────────────────────────────────
@@ -156,7 +161,7 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
         event_id=event_id,
         home_away=home_away,
         rest_days=rest_days,
-        max_daily_risk=MAX_DAILY_RISK,
+        max_daily_risk=min(MAX_DAILY_RISK, daily_risk_cap) if daily_risk_cap is not None else MAX_DAILY_RISK,
         max_per_game_risk=min(MAX_PER_GAME, game_risk_cap) if game_risk_cap else MAX_PER_GAME,
         raw_model_prob=raw_model_prob,
         model_prob=model_prob_val,
@@ -420,11 +425,11 @@ def send_game_market_alert(
     stake = 0.0
     if book_odds > 1.0 and ev > 0.0:
         stake = BANKROLL * (ev / (book_odds - 1.0)) * KELLY_FRACTION
-        stake = min(stake, BANKROLL * 0.03)
+        stake = min(stake, BANKROLL * MAX_BET_PCT)
     stake = _camouflage_stake(stake)
 
-    MAX_DAILY_RISK = BANKROLL * 1.00
-    MAX_PER_GAME   = BANKROLL * 0.40
+    MAX_DAILY_RISK = BANKROLL * DAILY_RISK_PCT
+    MAX_PER_GAME   = BANKROLL * GAME_RISK_PCT
 
     with db.get_conn() as conn:
         cursor = conn.cursor()
