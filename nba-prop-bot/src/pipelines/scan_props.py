@@ -35,7 +35,7 @@ from src.data.db import get_db_client
 from src.events.bus import get_bus
 from src.utils.logging_utils import get_logger
 from src.data.db import DatabaseClient
-from src.clients.odds_api import OddsApiClient, OddsApiQuotaError
+from src.clients.odds_api import OddsApiClient, OddsApiQuotaError, OddsApiBudgetError
 from src.clients.sportradar_client import SportradarClient
 from src.clients.nba_stats import NbaStatsClient
 from src.clients.injuries import InjuryClient
@@ -48,6 +48,7 @@ from src.config import (
     BDL_ENABLED, BDL_PROP_VENDORS,
     ELIMINATION_MODE, ELIMINATION_EDGE_BUMP,
     MIN_PLAYER_GAMES, BANKROLL, ALERT_LEAD_HOURS, DAILY_RISK_PCT,
+    SHARP_FETCH_HOURS, ODDS_FETCH_ALTS, GAME_MARKETS_ENABLED,
 )
 
 # Elimination games: bump every floor; 0.0 keeps regular behaviour.
@@ -111,9 +112,22 @@ _EVENTS_CACHE: Dict[str, Any] = {'data': [], 'fetched_at': None}
 _EVENTS_CACHE_TTL_SEC = 5400  # 90 minutes — matches scan interval
 ODDS_API_DEAD = False  # Track if API is out of credits
 
-# Only fetch sharp Pinnacle odds when the game tips off within this window.
-# Saves 1 Odds API credit per out-of-window game per scan.
-_TIP_OFF_SHARP_HOURS = 4  # was 6 — Pinnacle barely moves 4-6h out
+# Only fetch sharp odds when the game tips off within this window. With
+# ODDS_CACHE_MIN covering the window, that's one fetch per game per day.
+_TIP_OFF_SHARP_HOURS = SHARP_FETCH_HOURS
+
+# Markets per sharp fetch: one Odds API credit each, per game. Game markets
+# only feed game-market alerts; BDL supplies the spread/total the props use.
+_GAME_ODDS_MARKETS = [
+    'h2h', 'spreads', 'totals', 'team_totals',
+    'h2h_q1', 'spreads_q1', 'totals_q1',
+    'h2h_h1', 'spreads_h1', 'totals_h1',
+]
+_SHARP_FETCH_MARKETS = [
+    *PROP_MARKETS,
+    *(ALT_PROP_MARKETS if ODDS_FETCH_ALTS else []),
+    *(_GAME_ODDS_MARKETS if GAME_MARKETS_ENABLED else []),
+]
 
 
 def _get_team_adv_row(df, team_name: str):
@@ -884,17 +898,15 @@ def scan_props():
                 try:
                     sharp_odds = odds_client.get_event_odds(
                         event_id=event_id,
-                        markets=[
-                            *PROP_MARKETS, *ALT_PROP_MARKETS,
-                            'h2h', 'spreads', 'totals', 'team_totals',
-                            'h2h_q1', 'spreads_q1', 'totals_q1',
-                            'h2h_h1', 'spreads_h1', 'totals_h1',
-                        ]
+                        markets=_SHARP_FETCH_MARKETS,
+                        caller='scan',
                     )
                     sharp_bookmakers = sharp_odds.get('bookmakers', [])
-                except OddsApiQuotaError:
-                    ODDS_API_DEAD = True
-                    logger.warning(f"Odds API quota exceeded — falling back to Sportradar for {event_id}")
+                except OddsApiQuotaError as _qe:
+                    # A refused budget request costs nothing; later games may still fit.
+                    if not isinstance(_qe, OddsApiBudgetError):
+                        ODDS_API_DEAD = True
+                    logger.warning(f"Odds API unavailable ({_qe}) — falling back to Sportradar for {event_id}")
                     sharp_bookmakers = []
                     
                     if bdl_game_id:
@@ -937,12 +949,8 @@ def scan_props():
                     raise OddsApiQuotaError("Odds API is already dead")
                 odds_data = odds_client.get_event_odds(
                     event_id=event_id,
-                    markets=[
-                        *PROP_MARKETS, *ALT_PROP_MARKETS,
-                        'h2h', 'spreads', 'totals', 'team_totals',
-                        'h2h_q1', 'spreads_q1', 'totals_q1',
-                        'h2h_h1', 'spreads_h1', 'totals_h1',
-                    ]
+                    markets=_SHARP_FETCH_MARKETS,
+                    caller='scan',
                 )
             except OddsApiQuotaError:
                 ODDS_API_DEAD = True

@@ -1,6 +1,16 @@
+import json
+import os
+import threading
+import time
+from datetime import datetime
+
 import requests
+from dateutil import tz
 from typing import List, Dict, Any, Optional, Tuple
-from src.config import ODDS_API_KEY, ODDS_API_KEYS, ODDS_REGION, BOOKMAKERS, SHARP_BOOKS
+from src.config import (
+    ODDS_API_KEY, ODDS_API_KEYS, ODDS_REGION, BOOKMAKERS, SHARP_BOOKS,
+    ODDS_DAILY_CREDIT_BUDGET, ODDS_CACHE_MIN,
+)
 from src.utils.retry import retry_with_backoff
 from src.utils.logging_utils import get_logger
 
@@ -10,6 +20,49 @@ class OddsApiQuotaError(Exception):
     """Raised when all keys in the Odds API pool are out of credits or unauthorized (401/403)."""
     pass
 
+
+class OddsApiBudgetError(OddsApiQuotaError):
+    """Today's ODDS_DAILY_CREDIT_BUDGET is spent. Keys are not marked exhausted;
+    callers fall back exactly as they do for a dead key pool."""
+    pass
+
+
+# -- Daily credit ledger ------------------------------------------------------
+_ET = tz.gettz('America/New_York')
+_SPEND_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'odds_spend.json')
+_spend_lock = threading.Lock()
+
+
+def _load_spend() -> Dict[str, Any]:
+    today = datetime.now(_ET).strftime('%Y-%m-%d')
+    try:
+        with open(_SPEND_PATH, encoding='utf-8') as fh:
+            data = json.load(fh)
+    except Exception:
+        data = {}
+    if data.get('date') != today:
+        data = {'date': today, 'spent': 0, 'by_caller': {}}
+    return data
+
+
+def credits_spent_today() -> Dict[str, Any]:
+    """{'date', 'spent', 'by_caller'} for the current ET day."""
+    with _spend_lock:
+        return _load_spend()
+
+
+def _record_spend(cost: int, caller: str) -> int:
+    with _spend_lock:
+        data = _load_spend()
+        data['spent'] += cost
+        data['by_caller'][caller] = data['by_caller'].get(caller, 0) + cost
+        try:
+            with open(_SPEND_PATH, 'w', encoding='utf-8') as fh:
+                json.dump(data, fh, indent=2)
+        except Exception as e:
+            logger.warning(f"Odds API spend ledger write failed: {e}")
+        return data['spent']
+
 class OddsApiClient:
     BASE_URL = "https://api.the-odds-api.com/v4/sports"
     SPORT = "basketball_nba"
@@ -17,6 +70,8 @@ class OddsApiClient:
     # Shared pool state across all instances in this process
     _exhausted_keys: set = set()
     _key_quotas: Dict[str, Dict[str, int]] = {}
+    # (event_id, markets) -> (fetched_at monotonic, response json); ODDS_CACHE_MIN
+    _odds_cache: Dict[Tuple[str, Tuple[str, ...]], Tuple[float, Dict[str, Any]]] = {}
 
     def __init__(self, api_key: Optional[str] = None, api_keys: Optional[List[str]] = None):
         if api_keys:
@@ -168,10 +223,29 @@ class OddsApiClient:
         return response.json()
 
     @retry_with_backoff(retries=3, backoff_in_seconds=2)
-    def get_event_odds(self, event_id: str, markets: List[str]) -> Dict[str, Any]:
+    def get_event_odds(self, event_id: str, markets: List[str], caller: str = 'other',
+                       use_cache: bool = True) -> Dict[str, Any]:
+        """
+        Costs one credit per market returned. Cached per (event, markets) for
+        ODDS_CACHE_MIN (use_cache=False forces a fresh line, e.g. closing lines
+        for CLV); refused with OddsApiBudgetError once a request could push
+        today's spend past ODDS_DAILY_CREDIT_BUDGET.
+        """
         if '-' in event_id:
             logger.debug(f"Odds API: Skipping request for Sportradar ID {event_id}")
             return {"bookmakers": []}
+
+        cache_key = (event_id, tuple(sorted(markets)))
+        cached = OddsApiClient._odds_cache.get(cache_key)
+        if use_cache and cached and time.monotonic() - cached[0] < ODDS_CACHE_MIN * 60:
+            logger.debug(f"Odds API cache hit ({caller}): {event_id} {len(markets)} markets")
+            return cached[1]
+
+        spent = credits_spent_today()['spent']
+        if spent + len(markets) > ODDS_DAILY_CREDIT_BUDGET:
+            raise OddsApiBudgetError(
+                f"Daily Odds API budget reached ({spent}/{ODDS_DAILY_CREDIT_BUDGET} credits); "
+                f"{caller} request for {event_id} ({len(markets)} markets) refused")
 
         url = f"{self.BASE_URL}/{self.SPORT}/events/{event_id}/odds"
         params = {
@@ -185,7 +259,17 @@ class OddsApiClient:
         active_k = self.api_key
         logger.info(f"Fetching odds for event {event_id} markets: {markets} (key {active_k[:8] if active_k else 'N/A'}...)")
         response = self._execute_with_failover(url, base_params=params, timeout=15)
-        return response.json()
+        try:
+            cost = int(float(response.headers.get('x-requests-last')))
+        except (TypeError, ValueError):
+            cost = len(markets)
+        total = _record_spend(cost, caller)
+        logger.info(
+            f"Odds API cost: {cost} credit(s) [{caller}] {event_id} ({len(markets)} markets requested) "
+            f"- today {total}/{ODDS_DAILY_CREDIT_BUDGET}")
+        data = response.json()
+        OddsApiClient._odds_cache[cache_key] = (time.monotonic(), data)
+        return data
 
     @classmethod
     def get_pool_status(cls, keys: Optional[List[str]] = None) -> List[Dict[str, Any]]:

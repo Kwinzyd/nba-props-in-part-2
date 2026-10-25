@@ -40,6 +40,27 @@ GAME_MARKETS_ENABLED = os.getenv("GAME_MARKETS_ENABLED", "false").lower() in ("t
 # inside the window.
 ALERT_LEAD_HOURS = float(os.getenv("ALERT_LEAD_HOURS", "3"))
 
+# -- Odds API credit budget (free tier: 500 credits/key/month) --------------
+# Each event-odds request costs one credit per market returned (<=10 books is
+# one billing group; /events is free). Defaults fit ~3,000 credits/month.
+# Hard cap on credits spent per ET day across every caller (persisted in
+# src/data/odds_spend.json, so restarts don't reset it).
+ODDS_DAILY_CREDIT_BUDGET = int(os.getenv("ODDS_DAILY_CREDIT_BUDGET", "100"))
+# Event odds are reused for this long, so every scan, news-triggered scan and
+# CLV check within a game's window shares a single fetch.
+ODDS_CACHE_MIN = float(os.getenv("ODDS_CACHE_MIN", "240"))
+# The scan's sharp fetch happens once a game is this close to tip. Defaults to
+# the alert window so the first scan allowed to alert has the sharp line.
+SHARP_FETCH_HOURS = float(os.getenv("SHARP_FETCH_HOURS", str(ALERT_LEAD_HOURS)))
+# Alternate-line markets double the sharp fetch (7 -> 14 markets).
+ODDS_FETCH_ALTS = os.getenv("ODDS_FETCH_ALTS", "false").lower() in ("true", "1", "yes")
+# scout_lines: 7 prop markets per game every BDL_SHARP_SCAN_INTERVAL minutes
+# for steam snapshots (~23% of credit demand). BDL lines still feed
+# line_history on every scan.
+SCOUT_LINES_ENABLED = os.getenv("SCOUT_LINES_ENABLED", "false").lower() in ("true", "1", "yes")
+# game_arb: Kalshi game-winner arb, 1 credit per game per GAME_ARB_ODDS_TTL_MIN.
+GAME_ARB_ENABLED = os.getenv("GAME_ARB_ENABLED", "false").lower() in ("true", "1", "yes")
+
 # Playoff overrides. Lines tighten (sharper books, more handle) and rotations
 # compress (bench rarely sees the floor). When scan_props runs with
 # PLAYOFF_MODE=True it selects these in place of the regular-season values.

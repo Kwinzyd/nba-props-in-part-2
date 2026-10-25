@@ -149,6 +149,8 @@ def update_clv_lines() -> None:
                     odds_data = odds_client.get_event_odds(
                         event_id=event_id,
                         markets=markets_needed,
+                        caller='clv',
+                        use_cache=False,   # closing line, not the scan's pre-game fetch
                     )
                 except OddsApiQuotaError:
                     logger.warning(f"CLV: Odds API out of credits for event {event_id}. Falling back to Sportradar.")

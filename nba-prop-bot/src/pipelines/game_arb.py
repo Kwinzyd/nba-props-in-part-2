@@ -108,7 +108,7 @@ def _fetch_sharp_probs(
             sr_client = SportradarClient()
             data = sr_client.get_event_odds_oddsapi_format(game_id)
         else:
-            data = odds_client.get_event_odds(game_id, markets=["h2h"])
+            data = odds_client.get_event_odds(game_id, markets=["h2h"], caller='game_arb')
     except OddsApiQuotaError:
         logger.warning(f"game_arb: Odds API out of credits for {game_id}. Falling back to Sportradar.")
         with db.get_conn() as conn:

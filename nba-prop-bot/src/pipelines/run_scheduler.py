@@ -2,7 +2,7 @@
 Credit-aware scheduler for the NBA Prop Bot.
 
 Game-day logic:
-  - job_sync() runs at 09:00 ET every day (1 Odds API credit).
+  - job_sync() runs at 09:00 ET every day (0 credits: /events is free).
     It counts today's games and sets _today_game_count.
   - scan_props / update_clv_lines only run on game days (>0 games)
     AND within the 11am–11pm ET window AND quota >= QUOTA_FLOOR.
@@ -53,6 +53,7 @@ from src.pipelines.backup_db import backup_db
 from src.config import (
     SCAN_INTERVAL_MINUTES, QUOTA_FLOOR, TWITTER_POLL_INTERVAL,
     BDL_SHARP_SCAN_INTERVAL, OFF_SEASON, OFF_SEASON_AFTER_SYNCS,
+    SCOUT_LINES_ENABLED, GAME_ARB_ENABLED,
 )
 from src.events.bus import get_bus, EventBus
 from src.clients.ws_live_feed import start_live_feed
@@ -436,11 +437,13 @@ def job_breaking_news():
 
 def job_scout_lines():
     """
-    Lightweight line scout: fetches current Pinnacle/rec-book prop lines for
-    games within 4h of tip and writes snapshots to line_history (1 credit/game).
-    Immediately runs steam detection on the fresh data — no need to wait for
-    the next scheduled steam job.
+    Line scout: fetches current Pinnacle/rec-book prop lines for games within
+    4h of tip and writes snapshots to line_history (one credit per prop market
+    per game, ~7). Off unless SCOUT_LINES_ENABLED. Immediately runs steam
+    detection on the fresh data.
     """
+    if not SCOUT_LINES_ENABLED:
+        return
     if not _has_games():
         return
     if not _is_scan_window():
@@ -621,7 +624,10 @@ def job_sr_audit():
 
 
 def job_game_arb():
-    """Compare model win probs vs Kalshi game markets. No-op when KALSHI_API_KEY unset."""
+    """Compare sharp win probs vs Kalshi game markets. Off unless GAME_ARB_ENABLED;
+    no-op when KALSHI_API_KEY unset."""
+    if not GAME_ARB_ENABLED:
+        return
     if not _has_games():
         return
     submit_job("Game Arb", run_game_arb)
@@ -663,7 +669,7 @@ def start_scheduler():
     daily("04:15", job_sr_audit,          "Sportradar Audit")   # post-game audit
     daily("04:30", job_execution_summary, "Execution Summary")  # paper P&L recap
     daily("05:00", job_drift_monitor,     "Drift Monitor")      # drift check after settlement
-    schedule.every().day.at("09:00").do(job_sync)               # 1 credit; sets game count + hibernation
+    schedule.every().day.at("09:00").do(job_sync)               # 0 credits (/events is free); sets game count + hibernation
     daily("09:00", sync_sportradar_schedule, "Sportradar Schedule")
     daily("09:05", job_morning_briefing,  "Morning Briefing")   # subscriber daily briefing
     daily("09:15", job_stats,             "Stats")
@@ -676,11 +682,11 @@ def start_scheduler():
     schedule.every(30).days.at("04:00").do(unless_hibernating(job_train_clv_ml, "Train ML [CLV]"))
 
     # --- Game-day guarded jobs (skip when no games or outside window) ---
-    schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(job_scan)  # ~11 credits each
-    schedule.every(120).minutes.do(job_clv)                     # ~11 credits each
+    schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(job_scan)  # 1 credit/market/game in SHARP_FETCH_HOURS, cached ODDS_CACHE_MIN
+    schedule.every(120).minutes.do(job_clv)                     # 1 credit/alerted market/game at close
     schedule.every(20).minutes.do(job_steam)                    # 0 credits (DB only)
     schedule.every(30).minutes.do(job_exchange_arb)             # 0 credits (Kalshi API, no-op when key unset)
-    schedule.every(5).minutes.do(job_game_arb)                  # ~1 Odds API credit/game per GAME_ARB_ODDS_TTL_MIN (sharp ML cache)
+    schedule.every(5).minutes.do(job_game_arb)                  # off unless GAME_ARB_ENABLED; 1 credit/game per GAME_ARB_ODDS_TTL_MIN
     schedule.every(TWITTER_POLL_INTERVAL).seconds.do(job_breaking_news)  # 0 credits (Nitter)
     # Injury feed: free (BDL/scrape). Run frequently — late scratches move minutes hard.
     schedule.every(15).minutes.do(unless_hibernating(job_sync_injuries, "Sync Injuries"))

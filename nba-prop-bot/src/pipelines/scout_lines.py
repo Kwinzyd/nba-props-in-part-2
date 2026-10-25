@@ -135,7 +135,7 @@ def scout_lines(odds_client: OddsApiClient = None) -> Dict:
                 data = sr_client.get_event_odds_oddsapi_format(event['game_id'])
             else:
                 try:
-                    data = odds_client.get_event_odds(event['game_id'], markets=PROP_MARKETS)
+                    data = odds_client.get_event_odds(event['game_id'], markets=PROP_MARKETS, caller='scout')
                 except OddsApiQuotaError:
                     logger.warning(f"Scout: Odds API out of credits for {event['game_id']}. Falling back to Sportradar.")
                     with db.get_conn() as conn:

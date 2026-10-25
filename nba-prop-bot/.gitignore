@@ -15,3 +15,5 @@ scratch/
 src/models/calibration_market.json
 # full_run.bat output
 logs/
+# Odds API daily credit ledger
+src/data/odds_spend.json
