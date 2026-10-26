@@ -787,7 +787,9 @@ def scan_props():
             if dateutil.parser.isoparse(e['commence_time'])
                .astimezone(local_zone).strftime('%Y-%m-%d') == today
         ]
-        for e in events:
+        # Today's events only — the feed also lists future games (e.g. Christmas),
+        # which would otherwise overwrite today's event for the same team.
+        for e in odds_events:
             odds_map[e['home_team'].lower()] = e['id']
             odds_map[e['away_team'].lower()] = e['id']
     except (Exception, OddsApiQuotaError) as e:
