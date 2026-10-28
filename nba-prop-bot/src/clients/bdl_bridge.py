@@ -20,6 +20,7 @@ Usage:
 import time
 from typing import Dict, List, Optional, Set, Any
 from src.clients.bdl_client import BDLClient
+from src.config import BDL_PROFILES_ENABLED
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -375,6 +376,8 @@ class BDLBridge:
             "avg_pct_pts_paint":    0.0,
         }
         result = dict(defaults)
+        if not BDL_PROFILES_ENABLED:
+            return result
 
         if bdl_player_id in self._profile_cache:
             return self._profile_cache[bdl_player_id]
@@ -441,7 +444,7 @@ class BDLBridge:
         Batch-fetch season profiles for multiple players and store in cache.
         Reduces API calls from O(N) to O(1) per scan.
         """
-        if not player_ids:
+        if not player_ids or not BDL_PROFILES_ENABLED:
             return
         
         # Filter out already cached players

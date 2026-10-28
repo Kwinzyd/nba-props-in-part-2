@@ -42,6 +42,11 @@ ALERT_LEAD_HOURS = float(os.getenv("ALERT_LEAD_HOURS", "3"))
 # Overs went 21-38 (hit 36% vs 51% implied) through 2026-10-26 while unders
 # beat the market; off until the model's overs prove out.
 OVERS_ENABLED = os.getenv("OVERS_ENABLED", "false").lower() in ("true", "1", "yes")
+# Prop stake sizing: "flat" stakes BANKROLL * FLAT_STAKE_PCT on every play;
+# "kelly" scales by estimated edge. Flat while edge size shows no relation to
+# hit rate (13%+ edges hit exactly at implied through 2026-10-26).
+STAKE_MODE = os.getenv("STAKE_MODE", "flat").lower()
+FLAT_STAKE_PCT = float(os.getenv("FLAT_STAKE_PCT", "0.01"))
 
 # -- Odds API credit budget (free tier: 500 credits/key/month) --------------
 # Each event-odds request costs one credit per market returned (<=10 books is
@@ -144,6 +149,13 @@ BDL_API_KEY = os.getenv("BDL_API_KEY", "")
 # Use BDL as primary data source for props, injuries, lineups
 # Falls back to Odds API + scraping when BDL_API_KEY is empty
 BDL_ENABLED = bool(BDL_API_KEY)
+# BDL season profiles (usage%, touches, playtypes, drives) for XGBoost. Off:
+# the models are trained without them (zeros / box-score proxies), and the
+# profile parser never matched BDL's nested player.id / stats rows, so live
+# features already equal the training defaults. Each scan spent ~10 BDL
+# calls per game on them, feeding the rate limiting. Enable only together
+# with a parser fix and a retrain on the same features.
+BDL_PROFILES_ENABLED = os.getenv("BDL_PROFILES_ENABLED", "false").lower() in ("true", "1", "yes")
 # BDL vendors to pull prop lines from (rec books — sharp pricing still from Odds API)
 BDL_PROP_VENDORS_RAW = os.getenv("BDL_PROP_VENDORS", "draftkings,fanduel,caesars,betmgm")
 BDL_PROP_VENDORS = [v.strip() for v in BDL_PROP_VENDORS_RAW.split(",") if v.strip()]

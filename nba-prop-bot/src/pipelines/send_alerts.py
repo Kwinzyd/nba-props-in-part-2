@@ -6,7 +6,7 @@ from src.data.db import DatabaseClient, get_db_client
 from src.clients.sportradar_client import SportradarClient
 from src.config import (
     BANKROLL, KELLY_FRACTION, ELIMINATION_MODE, ELIMINATION_KELLY_MULT, GAME_MARKETS_ENABLED,
-    DAILY_RISK_PCT, GAME_RISK_PCT, MAX_BET_PCT,
+    DAILY_RISK_PCT, GAME_RISK_PCT, MAX_BET_PCT, STAKE_MODE, FLAT_STAKE_PCT,
 )
 from src.execution.executor import record_execution
 
@@ -142,7 +142,10 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
     ev    = edge_data.get('ev', 0.0)
     stake = 0.0
     if odds > 1 and ev > 0:
-        stake = BANKROLL * (ev / (odds - 1.0)) * dynamic_kelly
+        if STAKE_MODE == 'flat':
+            stake = BANKROLL * FLAT_STAKE_PCT * _ELIM_KELLY_MULT
+        else:
+            stake = BANKROLL * (ev / (odds - 1.0)) * dynamic_kelly
         stake = min(stake, BANKROLL * MAX_BET_PCT)  # hard cap per bet
     stake = _camouflage_stake(stake)
 
@@ -196,7 +199,7 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
             f"@ {edge_data['line_shift_sharp_book']}\n"
             if edge_data.get('line_shift_flag') else ""
         )
-        + f"\n<b>Suggested Stake (Kelly):</b> ${stake:.0f}"
+        + f"\n<b>Suggested Stake ({'Flat' if STAKE_MODE == 'flat' else 'Kelly'}):</b> ${stake:.0f}"
     )
 
     # Attempt to attach Sportradar Logo
