@@ -683,7 +683,7 @@ def start_scheduler():
 
     # --- Game-day guarded jobs (skip when no games or outside window) ---
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(job_scan)  # 1 credit/market/game in SHARP_FETCH_HOURS, cached ODDS_CACHE_MIN
-    schedule.every(120).minutes.do(job_clv)                     # 1 credit/alerted market/game at close
+    schedule.every(5).minutes.do(job_clv)                       # 1 credit/alerted market/game at close (ODDS_CLV_CREDIT_BUDGET)
     schedule.every(20).minutes.do(job_steam)                    # 0 credits (DB only)
     schedule.every(30).minutes.do(job_exchange_arb)             # 0 credits (Kalshi API, no-op when key unset)
     schedule.every(5).minutes.do(job_game_arb)                  # off unless GAME_ARB_ENABLED; 1 credit/game per GAME_ARB_ODDS_TTL_MIN

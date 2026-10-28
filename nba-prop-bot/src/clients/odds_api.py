@@ -9,7 +9,7 @@ from dateutil import tz
 from typing import List, Dict, Any, Optional, Tuple
 from src.config import (
     ODDS_API_KEY, ODDS_API_KEYS, ODDS_REGION, BOOKMAKERS, SHARP_BOOKS,
-    ODDS_DAILY_CREDIT_BUDGET, ODDS_CACHE_MIN,
+    ODDS_DAILY_CREDIT_BUDGET, ODDS_CLV_CREDIT_BUDGET, ODDS_CACHE_MIN,
 )
 from src.utils.retry import retry_with_backoff
 from src.utils.logging_utils import get_logger
@@ -229,7 +229,8 @@ class OddsApiClient:
         Costs one credit per market returned. Cached per (event, markets) for
         ODDS_CACHE_MIN (use_cache=False forces a fresh line, e.g. closing lines
         for CLV); refused with OddsApiBudgetError once a request could push
-        today's spend past ODDS_DAILY_CREDIT_BUDGET.
+        today's spend past ODDS_DAILY_CREDIT_BUDGET (caller='clv' draws on
+        its own ODDS_CLV_CREDIT_BUDGET instead).
         """
         if '-' in event_id:
             logger.debug(f"Odds API: Skipping request for Sportradar ID {event_id}")
@@ -241,10 +242,15 @@ class OddsApiClient:
             logger.debug(f"Odds API cache hit ({caller}): {event_id} {len(markets)} markets")
             return cached[1]
 
-        spent = credits_spent_today()['spent']
-        if spent + len(markets) > ODDS_DAILY_CREDIT_BUDGET:
+        today = credits_spent_today()
+        clv_spent = today['by_caller'].get('clv', 0)
+        if caller == 'clv':
+            spent, budget = clv_spent, ODDS_CLV_CREDIT_BUDGET
+        else:
+            spent, budget = today['spent'] - clv_spent, ODDS_DAILY_CREDIT_BUDGET
+        if spent + len(markets) > budget:
             raise OddsApiBudgetError(
-                f"Daily Odds API budget reached ({spent}/{ODDS_DAILY_CREDIT_BUDGET} credits); "
+                f"Daily Odds API budget reached ({spent}/{budget} credits); "
                 f"{caller} request for {event_id} ({len(markets)} markets) refused")
 
         url = f"{self.BASE_URL}/{self.SPORT}/events/{event_id}/odds"

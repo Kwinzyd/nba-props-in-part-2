@@ -81,3 +81,21 @@ def test_scan_requests_only_prop_markets_by_default():
     import src.pipelines.scan_props as sp
     if not ODDS_FETCH_ALTS and not GAME_MARKETS_ENABLED:
         assert sp._SHARP_FETCH_MARKETS == list(PROP_MARKETS)
+
+
+def test_clv_has_its_own_allowance(client, monkeypatch):
+    monkeypatch.setattr(oa, 'ODDS_CLV_CREDIT_BUDGET', 4)
+    oa._record_spend(20, 'scan')           # scan budget fully spent
+    client.get_event_odds('evt4', MARKETS[:2], caller='clv', use_cache=False)
+    assert oa.credits_spent_today()['by_caller']['clv'] == 1
+    with pytest.raises(oa.OddsApiBudgetError):
+        client.get_event_odds('evt5', MARKETS, caller='clv')   # 1 + 4 requested > 4
+    with pytest.raises(oa.OddsApiBudgetError):
+        client.get_event_odds('evt6', MARKETS[:1], caller='scan')
+
+
+def test_clv_spend_does_not_count_against_scan_budget(client, monkeypatch):
+    monkeypatch.setattr(oa, 'ODDS_CLV_CREDIT_BUDGET', 50)
+    oa._record_spend(15, 'clv')
+    client.get_event_odds('evt7', MARKETS, caller='scan')   # 0 scan spent + 4 <= 20
+    assert oa.credits_spent_today()['by_caller']['scan'] == 3

@@ -39,6 +39,9 @@ GAME_MARKETS_ENABLED = os.getenv("GAME_MARKETS_ENABLED", "false").lower() in ("t
 # injury news. Keep it above SCAN_INTERVAL_MINUTES so every game gets a scan
 # inside the window.
 ALERT_LEAD_HOURS = float(os.getenv("ALERT_LEAD_HOURS", "3"))
+# Overs went 21-38 (hit 36% vs 51% implied) through 2026-10-26 while unders
+# beat the market; off until the model's overs prove out.
+OVERS_ENABLED = os.getenv("OVERS_ENABLED", "false").lower() in ("true", "1", "yes")
 
 # -- Odds API credit budget (free tier: 500 credits/key/month) --------------
 # Each event-odds request costs one credit per market returned (<=10 books is
@@ -46,6 +49,9 @@ ALERT_LEAD_HOURS = float(os.getenv("ALERT_LEAD_HOURS", "3"))
 # Hard cap on credits spent per ET day across every caller (persisted in
 # src/data/odds_spend.json, so restarts don't reset it).
 ODDS_DAILY_CREDIT_BUDGET = int(os.getenv("ODDS_DAILY_CREDIT_BUDGET", "100"))
+# Separate daily allowance for CLV closing-line fetches (1 credit per alerted
+# market per game), so closing lines never starve the scans and vice versa.
+ODDS_CLV_CREDIT_BUDGET = int(os.getenv("ODDS_CLV_CREDIT_BUDGET", "30"))
 # Event odds are reused for this long, so every scan, news-triggered scan and
 # CLV check within a game's window shares a single fetch.
 ODDS_CACHE_MIN = float(os.getenv("ODDS_CACHE_MIN", "240"))

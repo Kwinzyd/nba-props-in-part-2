@@ -319,7 +319,16 @@ class PostgresDatabaseClient:
                  stake, max_per_game_risk)
             )
             row = cur.fetchone()
-            return row['id'] if row else None
+            if not row:
+                return None
+            conn.execute(
+                """
+                INSERT INTO clv_tracking (alert_id, player_id, market, side, alert_odds, alert_time)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                """,
+                (row['id'], player_name, market, side, odds),
+            )
+            return row['id']
 
     def check_recent_alert(self, player_name: str, market: str, line: float,
                            side: str, edge: float) -> bool:
