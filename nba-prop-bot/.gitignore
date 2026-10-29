@@ -17,3 +17,4 @@ src/models/calibration_market.json
 logs/
 # Odds API daily credit ledger
 src/data/odds_spend.json
+src/data/telegram_outbox.json

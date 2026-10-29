@@ -511,6 +511,14 @@ def job_sync_injuries():
             _maybe_submit_scan("LATE-SCRATCH")
 
 
+def job_telegram_outbox():
+    """Retry Telegram messages that failed to send (outage, timeout)."""
+    try:
+        bot.flush_outbox()
+    except Exception as e:
+        logger.warning(f"Telegram outbox flush failed: {e}")
+
+
 def job_flush_alerts():
     """Send Tier-2 digest (Props / Game Markets / SGPs)."""
     if not _has_games():
@@ -696,6 +704,8 @@ def start_scheduler():
     # Feeds steam detection with data every BDL_SHARP_SCAN_INTERVAL (default 30 min)
     # rather than every 90 min scan cycle.
     schedule.every(BDL_SHARP_SCAN_INTERVAL).minutes.do(job_scout_lines)
+
+    schedule.every(2).minutes.do(job_telegram_outbox)            # retry failed Telegram sends
 
     # --- Tier-2 digest flushes (Props / Game Markets / SGPs) ---
     schedule.every().day.at("12:00").do(job_flush_alerts)

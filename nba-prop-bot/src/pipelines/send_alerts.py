@@ -212,8 +212,10 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
         msg = f"<a href='{logo_url}'>&#8205;</a>" + msg
 
     # Send immediately to all subscribers so they get the edge before the line moves.
+    # A failed send lands in the Telegram outbox and is retried (flush_outbox).
+    delivered = 0
     try:
-        _bot.broadcast(msg, db=db)
+        delivered = _bot.broadcast(msg, db=db)
     except Exception as _e:
         logger.warning(f"Telegram broadcast failed (will still queue): {_e}")
 
@@ -225,7 +227,9 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
         f"@{book} {_parlay_american(odds)} | {edge:.1%} | ${stake:.0f}"
     )
     db.queue_pending_alert('prop', title, msg, priority=edge, game_date=game_date)
-    logger.info(f"Alert sent + queued: {player} {market} {side} {line} @ {book}")
+    logger.info(
+        f"Alert {'sent' if delivered else 'NOT delivered (Telegram outbox)'} + queued: "
+        f"{player} {market} {side} {line} @ {book}")
 
 
 def send_line_disagreement_alert(

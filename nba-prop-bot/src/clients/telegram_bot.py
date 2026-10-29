@@ -1,9 +1,48 @@
+import json
+import os
+import threading
+import time
+from datetime import datetime
+
 import requests
 from src.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 from src.utils.retry import retry_with_backoff
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+# -- Outbox: sends that failed (timeout, network, 5xx/429) are persisted here and
+# retried by flush_outbox() so a Telegram outage delays alerts instead of
+# dropping them. Survives restarts; entries older than _OUTBOX_MAX_AGE_SEC are
+# dropped as stale.
+_OUTBOX_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'telegram_outbox.json')
+_OUTBOX_MAX_AGE_SEC = 12 * 3600
+# After a failure, new messages skip the network for this long and go straight
+# to the outbox, so an outage doesn't stall every scan for 10s per alert.
+_FAIL_COOLDOWN_SEC = 120
+_outbox_lock = threading.Lock()
+_last_failure = 0.0
+
+
+def _load_outbox() -> list:
+    try:
+        with open(_OUTBOX_PATH, encoding='utf-8') as fh:
+            return json.load(fh)
+    except Exception:
+        return []
+
+
+def _save_outbox(items: list) -> None:
+    try:
+        with open(_OUTBOX_PATH, 'w', encoding='utf-8') as fh:
+            json.dump(items, fh, indent=1)
+    except Exception as e:
+        logger.warning(f"Telegram outbox write failed: {e}")
+
+
+def outbox_size() -> int:
+    with _outbox_lock:
+        return len(_load_outbox())
 
 
 class TelegramBotClient:
@@ -38,19 +77,78 @@ class TelegramBotClient:
             logger.warning("Telegram credentials missing. Skipping alert.")
             return False
 
-        url = f"{self.base_url}/sendMessage"
-        payload = {
-            "chat_id": self.chat_id,
-            "text": text,
-            "parse_mode": parse_mode,
-        }
-
-        try:
-            response = requests.post(url, json=payload, timeout=10)
-            return response.json().get("ok", False)
-        except requests.exceptions.Timeout:
-            logger.warning("Telegram send_instant timed out — skipping.")
+        if time.time() - _last_failure < _FAIL_COOLDOWN_SEC:
+            self._enqueue(text, parse_mode)
             return False
+
+        ok, retryable, why = self._post(text, parse_mode)
+        if ok:
+            return True
+        if retryable:
+            self._enqueue(text, parse_mode)
+            logger.warning(f"Telegram send failed ({why}) — queued for retry.")
+        else:
+            logger.warning(f"Telegram rejected message ({why}) — not retried.")
+        return False
+
+    def _post(self, text: str, parse_mode: str):
+        """One sendMessage attempt -> (ok, retryable, reason)."""
+        global _last_failure
+        payload = {"chat_id": self.chat_id, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        try:
+            response = requests.post(f"{self.base_url}/sendMessage", json=payload, timeout=10)
+        except requests.exceptions.RequestException as e:
+            _last_failure = time.time()
+            return False, True, type(e).__name__
+        if response.ok:
+            return True, False, ''
+        retryable = response.status_code == 429 or response.status_code >= 500
+        if retryable:
+            _last_failure = time.time()
+        return False, retryable, f"HTTP {response.status_code}: {response.text[:150]}"
+
+    def _enqueue(self, text: str, parse_mode: str) -> None:
+        with _outbox_lock:
+            items = _load_outbox()
+            items.append({"queued_at": time.time(), "text": text, "parse_mode": parse_mode})
+            _save_outbox(items)
+
+    def flush_outbox(self) -> int:
+        """
+        Resend queued messages oldest-first, each marked as delayed; stops at
+        the first failure (Telegram still down). Returns the number delivered.
+        """
+        global _last_failure
+        if not self.token or not self.chat_id:
+            return 0
+        with _outbox_lock:
+            items = _load_outbox()
+            if not items:
+                return 0
+            now = time.time()
+            fresh = [m for m in items if now - m["queued_at"] < _OUTBOX_MAX_AGE_SEC]
+            if len(fresh) < len(items):
+                logger.warning(f"Telegram outbox: dropped {len(items) - len(fresh)} stale message(s).")
+            sent = 0
+            for m in fresh:
+                stamp = datetime.fromtimestamp(m["queued_at"]).strftime('%I:%M %p').lstrip('0')
+                note = f"⏳ Delayed — queued {stamp}"
+                prefix = f"<i>{note}</i>\n" if m.get("parse_mode") == "HTML" else f"{note}\n"
+                ok, retryable, why = self._post(prefix + m["text"], m.get("parse_mode"))
+                if not ok and retryable:
+                    break
+                if not ok:
+                    logger.warning(f"Telegram outbox: message rejected ({why}) — dropped.")
+                sent += ok
+                m["done"] = True
+            remaining = [m for m in fresh if not m.get("done")]
+            _save_outbox(remaining)
+        if sent:
+            _last_failure = 0.0
+            logger.info(f"Telegram outbox: delivered {sent} delayed message(s), {len(remaining)} still queued.")
+        return sent
 
     def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
         """Backward-compatible alias for send_instant."""
