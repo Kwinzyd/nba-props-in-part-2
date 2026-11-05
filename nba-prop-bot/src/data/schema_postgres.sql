@@ -136,7 +136,8 @@ CREATE TABLE IF NOT EXISTS clv_tracking (
     implied_alert   REAL,
     clv             REAL,
     closing_time    TIMESTAMPTZ,
-    alert_id        BIGINT REFERENCES alerts_sent(id)
+    alert_id        BIGINT REFERENCES alerts_sent(id),
+    close_book      TEXT    -- book the closing price came from (sharp, else the alerted book)
 );
 
 CREATE TABLE IF NOT EXISTS model_versions (

@@ -48,7 +48,11 @@ def main():
     full_run_parser = subparsers.add_parser("full_run", help="Settle alerts, run calibration, then start scheduler")
     
     args = parser.parse_args()
-    
+
+    if args.command in ("run", "full_run"):
+        from src.utils.logging_utils import enable_file_logging
+        print(f"Logging to {enable_file_logging()}")
+
     if args.command == "run":
         from src.pipelines.run_scheduler import start_scheduler
         start_scheduler()

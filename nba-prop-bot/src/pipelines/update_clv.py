@@ -11,6 +11,10 @@ Pinnacle / Circa / Bookmaker closing price and saves the CLV delta.
                       re-spent on trackers with no sharp price.
   • Pinnacle-first  — sharp books in priority order; Pinnacle is the gold
                       standard closing line signal.
+  • Same-book fallback — sharp books don't post steals/blocks and often hang
+                      a different line, so without a sharp price we compare
+                      against the alerted book's own close (same response, no
+                      extra credits). clv_tracking.close_book records which.
   • Same line only  — a closing price is only comparable when the sharp
                       book still hangs the alerted line.
   • JOIN enrichment — joins clv_tracking with alerts_sent to retrieve the
@@ -76,6 +80,7 @@ def update_clv_lines() -> None:
                    ct.alert_odds,
                    a.event_id,
                    a.line,
+                   a.book,
                    a.game_date
             FROM   clv_tracking ct
             LEFT   JOIN alerts_sent a ON a.id = ct.alert_id
@@ -186,7 +191,9 @@ def update_clv_lines() -> None:
         # Build lookup: {(book_key, market_key, player_lower, side_lower, point): price}
         prices: Dict[Tuple, float] = {}
         for book in bookmakers:
-            book_key = _norm(book.get('key') or book.get('title', ''))
+            # Alerts store either the key ('betmgm') or the title ('Caesars'
+            # for key 'williamhill_us'), so index each book under both.
+            book_ids = {_norm(book.get('key') or ''), _norm(book.get('title') or '')} - {''}
             for mkt in book.get('markets', []):
                 mkt_key = mkt.get('key', '')
                 for outcome in mkt.get('outcomes', []):
@@ -195,7 +202,8 @@ def update_clv_lines() -> None:
                     price = float(outcome.get('price', 0) or 0)
                     point = outcome.get('point')
                     if price > 1.0 and point is not None:
-                        prices[(book_key, mkt_key, desc, name, float(point))] = price
+                        for book_id in book_ids:
+                            prices[(book_id, mkt_key, desc, name, float(point))] = price
 
         # ── Grade each tracker against the closing price ──────────────────
         for tracker in trackers:
@@ -208,14 +216,15 @@ def update_clv_lines() -> None:
             if line is None:
                 continue
 
-            # Find sharpest available closing price at the alerted line
+            # Find sharpest available closing price at the alerted line,
+            # else the alerted book's own closing price.
             closing_price = 0.0
             source_book   = ''
-            for sharp in _SHARP_PRIORITY:
-                key = (sharp, market, player_n, side_n, float(line))
-                if key in prices:
+            for book_id in _SHARP_PRIORITY + [_norm(tracker.get('book') or '')]:
+                key = (book_id, market, player_n, side_n, float(line))
+                if book_id and key in prices:
                     closing_price = prices[key]
-                    source_book   = sharp
+                    source_book   = book_id
                     break
 
             if closing_price <= 1.0:
@@ -228,7 +237,8 @@ def update_clv_lines() -> None:
             implied_closing = decimal_to_implied_prob(closing_price)
             implied_alert   = decimal_to_implied_prob(alert_odds)
             db.update_clv_closing_line(
-                track_id, closing_price, implied_closing, implied_alert
+                track_id, closing_price, implied_closing, implied_alert,
+                close_book=source_book,
             )
             updated += 1
             logger.info(

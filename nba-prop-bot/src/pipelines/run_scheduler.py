@@ -14,6 +14,7 @@ Configurable via env vars:
   QUOTA_FLOOR            (default 30)  — pause API jobs below this credit level
 """
 
+import logging
 import os
 import time
 import threading
@@ -62,6 +63,12 @@ from src.pipelines.game_arb import run_game_arb
 from src.pipelines.sync_sportradar import sync_sportradar_schedule, sync_sportradar_lineups, audit_finished_games
 
 _WATCHDOG_TIMEOUT_SEC = int(os.getenv('WATCHDOG_TIMEOUT_SEC', '300'))  # 5 min default
+# Past these, the watchdog exits the process (code 3) so full_run.bat /
+# run_bot.ps1 restart it. A scan that hangs (e.g. a stuck HTTP call) keeps
+# _scan_in_progress set and silently blocks every later scan — that is what
+# killed all of Oct 28's alerts. Longest healthy scan seen so far: 34 min.
+_WATCHDOG_EXIT_SEC = int(os.getenv('WATCHDOG_EXIT_SEC', '1800'))
+_SCAN_STALL_SEC = int(os.getenv('SCAN_STALL_MIN', '90')) * 60
 # Minimum seconds between scan submissions to prevent duplicate triggers.
 _SCAN_COOLDOWN_SEC = int(os.getenv('SCAN_COOLDOWN_SEC', '60'))
 # News-triggered scans (breaking news, late scratches, injury events) at most
@@ -113,6 +120,19 @@ def _start_watchdog():
             if _last_tick == 0:
                 continue  # scheduler not yet started
             stale = time.monotonic() - _last_tick
+            scan_age = time.monotonic() - _scan_started_at if _scan_in_progress else 0
+            if stale > _WATCHDOG_EXIT_SEC or scan_age > _SCAN_STALL_SEC:
+                what = (f"scheduler loop stalled for {int(stale // 60)} min" if stale > _WATCHDOG_EXIT_SEC
+                        else f"scan stuck for {int(scan_age // 60)} min")
+                logger.error(f"Watchdog: {what} — exiting so the bot restarts.")
+                try:
+                    # send_instant times out fast and queues to the outbox,
+                    # so this arrives after the restart if not now.
+                    bot.send_instant(f"⚠️ <b>Watchdog</b>: {what} — restarting the bot.")
+                except Exception:
+                    pass
+                logging.shutdown()
+                os._exit(3)
             if stale > _WATCHDOG_TIMEOUT_SEC:
                 msg = (
                     f"⚠️ <b>Watchdog alert</b>: scheduler loop has not ticked "
@@ -279,15 +299,17 @@ def submit_job(job_name: str, func, *args):
 
 _scan_lock = threading.Lock()
 _scan_in_progress = False
+_scan_started_at = 0.0   # monotonic; read by the watchdog
 
 
 def _run_guarded_scan(label: str, scan_func):
-    global _scan_in_progress
+    global _scan_in_progress, _scan_started_at
     with _scan_lock:
         if _scan_in_progress:
             logger.info(f"Scan [{label}] skipped: another scan is already in progress.")
             return
         _scan_in_progress = True
+        _scan_started_at = time.monotonic()
 
     try:
         scan_func()
