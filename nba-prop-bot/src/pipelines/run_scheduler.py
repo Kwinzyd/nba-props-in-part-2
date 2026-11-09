@@ -54,7 +54,7 @@ from src.pipelines.backup_db import backup_db
 from src.config import (
     SCAN_INTERVAL_MINUTES, QUOTA_FLOOR, TWITTER_POLL_INTERVAL,
     BDL_SHARP_SCAN_INTERVAL, OFF_SEASON, OFF_SEASON_AFTER_SYNCS,
-    SCOUT_LINES_ENABLED, GAME_ARB_ENABLED, KEEP_AWAKE,
+    SCOUT_LINES_ENABLED, GAME_ARB_ENABLED, KEEP_AWAKE, ML_AUTO_RETRAIN,
 )
 from src.utils.keep_awake import keep_system_awake
 from src.events.bus import get_bus, EventBus
@@ -595,7 +595,8 @@ def job_drift_monitor():
         logger.warning("Drift ALARM — triggering immediate retrain.")
         notify("Train Calibration [drift alarm]", train_market_anchored_calibration)
         reload_calibration_model()
-        notify("Train ML [drift alarm]", train_ml_models)
+        if ML_AUTO_RETRAIN:
+            notify("Train ML [drift alarm]", train_ml_models)
 
 
 def job_backup_db():
@@ -732,8 +733,11 @@ def start_scheduler():
     daily("10:00", job_market_stats,      "Market Stats")
     daily("10:15", job_timing_analysis,   "Timing Analysis")
     schedule.every(6).hours.do(unless_hibernating(job_exposure, "Exposure"))
-    schedule.every().sunday.at("03:00").do(unless_hibernating(job_train_ml, "Train ML"))  # weekly retrain
-    schedule.every(30).days.at("04:00").do(unless_hibernating(job_train_clv_ml, "Train ML [CLV]"))
+    if ML_AUTO_RETRAIN:
+        schedule.every().sunday.at("03:00").do(unless_hibernating(job_train_ml, "Train ML"))  # weekly retrain
+        schedule.every(30).days.at("04:00").do(unless_hibernating(job_train_clv_ml, "Train ML [CLV]"))
+    else:
+        logger.info("ML auto-retrain off (ML_AUTO_RETRAIN=false) — models change only via `main.py train`.")
 
     # --- Game-day guarded jobs (skip when no games or outside window) ---
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(job_scan)  # 1 credit/market/game in SHARP_FETCH_HOURS, cached ODDS_CACHE_MIN

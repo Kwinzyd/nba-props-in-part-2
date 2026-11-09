@@ -52,6 +52,13 @@ PARLAYS_ENABLED = os.getenv("PARLAYS_ENABLED", "false").lower() in ("true", "1",
 # Store every scanned prop side (scan_candidates) to score the model against
 # the market on all props, not just alerts (`python main.py model_eval`).
 CANDIDATE_LOG_ENABLED = os.getenv("CANDIDATE_LOG_ENABLED", "true").lower() in ("true", "1", "yes")
+# Scheduled XGBoost retrains (weekly, 30-day CLV-feedback, drift alarm). Off:
+# training leaks across time (shuffled KFold, current-season opponent stats
+# on past games) and a retrain overwrites the live models with no check that
+# it beats the market. Turn on once training has a time split and a
+# promotion gate. Manual `python main.py train` still works; the nightly
+# calibration refit is unaffected.
+ML_AUTO_RETRAIN = os.getenv("ML_AUTO_RETRAIN", "false").lower() in ("true", "1", "yes")
 # Windows: keep the PC from idle-sleeping while the scheduler runs (src/utils/keep_awake.py).
 KEEP_AWAKE = os.getenv("KEEP_AWAKE", "true").lower() in ("true", "1", "yes")
 # Prop stake sizing: "flat" stakes BANKROLL * FLAT_STAKE_PCT on every play;
