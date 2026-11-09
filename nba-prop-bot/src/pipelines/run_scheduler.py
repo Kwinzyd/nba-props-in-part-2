@@ -69,6 +69,9 @@ _WATCHDOG_TIMEOUT_SEC = int(os.getenv('WATCHDOG_TIMEOUT_SEC', '300'))  # 5 min d
 # killed all of Oct 28's alerts. Longest healthy scan seen so far: 34 min.
 _WATCHDOG_EXIT_SEC = int(os.getenv('WATCHDOG_EXIT_SEC', '1800'))
 _SCAN_STALL_SEC = int(os.getenv('SCAN_STALL_MIN', '90')) * 60
+# The watchdog wakes every 60s; a gap longer than this means the PC was asleep
+# (every "stall" restart Nov 5–8 matched a Windows sleep/wake, not a hang).
+_SUSPEND_GAP_SEC = 180
 # Minimum seconds between scan submissions to prevent duplicate triggers.
 _SCAN_COOLDOWN_SEC = int(os.getenv('SCAN_COOLDOWN_SEC', '60'))
 # News-triggered scans (breaking news, late scratches, injury events) at most
@@ -107,6 +110,14 @@ _last_event_scan_submit: float = 0.0
 # In-process watchdog
 # ---------------------------------------------------------------------------
 
+def _stall_ages(now: float, resumed_at: float):
+    """(seconds since the loop ticked, seconds the current scan has run), both
+    measured from no earlier than the last wake from sleep."""
+    stale = now - max(_last_tick, resumed_at)
+    scan_age = now - max(_scan_started_at, resumed_at) if _scan_in_progress else 0.0
+    return stale, scan_age
+
+
 def _start_watchdog():
     """
     Daemon thread: fires a Telegram alarm if the main scheduler loop has not
@@ -115,12 +126,22 @@ def _start_watchdog():
     (tells you the loop hung before Railway caught it).
     """
     def _watch():
+        last_check = time.monotonic()
+        resumed_at = 0.0
         while True:
             time.sleep(60)
+            now = time.monotonic()
+            # monotonic() keeps counting while the PC sleeps, so after a
+            # suspend everything looks stalled. If this thread itself overslept,
+            # the machine was asleep: restart the stall clocks from the wake-up.
+            if now - last_check > _SUSPEND_GAP_SEC:
+                logger.warning(f"Watchdog: system was asleep ~{int((now - last_check) // 60)} min "
+                               f"— not counted as a stall.")
+                resumed_at = now
+            last_check = now
             if _last_tick == 0:
                 continue  # scheduler not yet started
-            stale = time.monotonic() - _last_tick
-            scan_age = time.monotonic() - _scan_started_at if _scan_in_progress else 0
+            stale, scan_age = _stall_ages(now, resumed_at)
             if stale > _WATCHDOG_EXIT_SEC or scan_age > _SCAN_STALL_SEC:
                 what = (f"scheduler loop stalled for {int(stale // 60)} min" if stale > _WATCHDOG_EXIT_SEC
                         else f"scan stuck for {int(scan_age // 60)} min")
