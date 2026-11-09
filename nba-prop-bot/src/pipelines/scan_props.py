@@ -73,6 +73,7 @@ from src.models.edge_ranker import (
     set_playoff_mode as set_ranker_playoff_mode,
 )
 from src.models.calibration_model import calibrate_candidates
+from src.pipelines.shadow_overs import record_shadow_overs
 from src.models.ml_model import get_ml_projection
 from src.pipelines.send_alerts import evaluate_and_alert, send_game_market_alert, send_line_disagreement_alert
 from src.pipelines.combos import generate_and_alert_combos, generate_slate_ultimate, generate_four_leg_parlays
@@ -2239,6 +2240,10 @@ def scan_props():
     # Games that exited the loop early were never calibrated above.
     calibrate_candidates([c for c in candidates if not c.get('calibrated')], playoff_mode=PLAYOFF_MODE)
     actionable = _actionable_edges(candidates)
+    try:
+        record_shadow_overs(candidates, db)
+    except Exception as e:
+        logger.warning(f"Shadow overs: recording failed: {e}")
 
     logger.info(
         f"Scan complete: {len(candidates)} candidates, {len(actionable)} actionable edges. "

@@ -486,3 +486,28 @@ CREATE TABLE IF NOT EXISTS sportradar_audit_logs (
     box_saved    BOOLEAN DEFAULT FALSE,
     audited_at   TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Paper-tracked overs while OVERS_ENABLED is off (src/pipelines/shadow_overs.py).
+CREATE TABLE IF NOT EXISTS shadow_picks (
+    id              BIGSERIAL PRIMARY KEY,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    game_date       TEXT    NOT NULL,
+    event_id        TEXT,
+    player_name     TEXT    NOT NULL,
+    market          TEXT    NOT NULL,
+    line            REAL    NOT NULL,
+    side            TEXT    NOT NULL,
+    book            TEXT,
+    odds            REAL    NOT NULL,
+    implied_prob    REAL,
+    raw_model_prob  REAL,
+    model_prob      REAL,   -- calibrated (what the live rules saw)
+    edge            REAL,   -- ranked edge on the raw model prob
+    edge_min        REAL,
+    hours_to_tipoff REAL,
+    actual_result   REAL,
+    won             BOOLEAN,
+    push            BOOLEAN,
+    settled_at      TIMESTAMPTZ,
+    UNIQUE (game_date, player_name, market, line, side)
+);

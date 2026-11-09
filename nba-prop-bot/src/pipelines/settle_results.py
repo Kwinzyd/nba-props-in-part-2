@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Tuple
 from src.data.db import get_db_client
 from src.clients.bdl_client import BDLClient
 from src.clients.telegram_bot import TelegramBotClient
+from src.pipelines.shadow_overs import settle_shadow_picks, unsettled_shadow_dates
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -183,6 +184,16 @@ def _build_stat_index(stats: List[dict]) -> Dict[str, dict]:
     return index
 
 
+def _find_stat_row(stat_index: Dict[str, dict], player_name: str) -> Optional[dict]:
+    """Exact normalized name, else a unique last-name match, else None."""
+    norm = _normalize_name(player_name)
+    if norm in stat_index:
+        return stat_index[norm]
+    last = norm.split()[-1] if norm else ''
+    candidates = [v for k, v in stat_index.items() if k.split()[-1] == last]
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _build_game_index(games: List[dict]) -> Dict[str, dict]:
     """
     Build {"visitor @ home" (normalized): game_dict} from BDL games.
@@ -236,7 +247,8 @@ def settle_alerts(target_date: Optional[str] = None) -> None:
             (target_date,),
         ).fetchall()
 
-    if not rows:
+    shadow_pending = bool(unsettled_shadow_dates(db, target_date, target_date))
+    if not rows and not shadow_pending:
         logger.info(f"No unsettled bets for {target_date} — nothing to do.")
         return
 
@@ -265,6 +277,13 @@ def settle_alerts(target_date: Optional[str] = None) -> None:
         f"BDL: {len(final_games)} final game(s), "
         f"{len(final_stats)} player stat line(s) available"
     )
+
+    # Paper-tracked overs ride on the same box scores; never block real grading.
+    if shadow_pending:
+        try:
+            settle_shadow_picks(db, target_date, lambda name: _find_stat_row(stat_index, name), _grade_prop)
+        except Exception as exc:
+            logger.warning(f"Shadow overs: grading failed for {target_date}: {exc}")
 
     # ── 3. Grade each alert ───────────────────────────────────────────────
     wins = losses = pushes = skipped = 0
@@ -425,9 +444,11 @@ def settle_recent(days: int = 4) -> None:
             (start, yesterday),
         ).fetchall()
 
-    for row in rows:
-        d = row['game_date']
-        settle_alerts(target_date=d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d))
+    dates = {r['game_date'].strftime('%Y-%m-%d') if hasattr(r['game_date'], 'strftime') else str(r['game_date'])
+             for r in rows}
+    dates.update(unsettled_shadow_dates(db, start, yesterday))
+    for d in sorted(dates):
+        settle_alerts(target_date=d)
 
 
 if __name__ == "__main__":

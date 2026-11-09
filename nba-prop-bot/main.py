@@ -26,6 +26,10 @@ def main():
     # stats command
     stats_parser = subparsers.add_parser("stats", help="Show performance analytics")
     stats_parser.add_argument("--since", help="Only include alerts on/after this date (e.g. 2026-04-18)")
+
+    # shadow_stats command
+    shadow_parser = subparsers.add_parser("shadow_stats", help="Show paper-tracked overs (while OVERS_ENABLED is off)")
+    shadow_parser.add_argument("--since", help="Only include picks on/after this date")
     
     # Phase 4 Commands
     cal_parser = subparsers.add_parser("calibration", help="Check probability calibration and Brier score")
@@ -81,6 +85,10 @@ def main():
     elif args.command == "stats":
         from src.pipelines.analytics import generate_analytics
         generate_analytics(since=args.since)
+    elif args.command == "shadow_stats":
+        from src.pipelines.shadow_overs import shadow_report
+        from src.data.db import get_db_client
+        shadow_report(get_db_client(), since=args.since)
     elif args.command == "calibration":
         from src.pipelines.calibration import check_calibration
         check_calibration()
