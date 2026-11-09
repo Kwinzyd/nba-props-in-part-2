@@ -54,8 +54,9 @@ from src.pipelines.backup_db import backup_db
 from src.config import (
     SCAN_INTERVAL_MINUTES, QUOTA_FLOOR, TWITTER_POLL_INTERVAL,
     BDL_SHARP_SCAN_INTERVAL, OFF_SEASON, OFF_SEASON_AFTER_SYNCS,
-    SCOUT_LINES_ENABLED, GAME_ARB_ENABLED,
+    SCOUT_LINES_ENABLED, GAME_ARB_ENABLED, KEEP_AWAKE,
 )
+from src.utils.keep_awake import keep_system_awake
 from src.events.bus import get_bus, EventBus
 from src.clients.ws_live_feed import start_live_feed
 from src.pipelines.exchange_arb import run_exchange_arb
@@ -692,6 +693,8 @@ def start_scheduler():
     global _last_tick
     logger.info("Starting NBA Prop Bot scheduler (credit-aware mode)...")
     _start_watchdog()
+    if KEEP_AWAKE:
+        keep_system_awake()   # main thread: held until the process exits
     bot.start_listener(db=get_db_client())
 
     # --- Phase 3A: WebSocket live feed (no-op when LIVE_FEED_WS_URL unset) ---

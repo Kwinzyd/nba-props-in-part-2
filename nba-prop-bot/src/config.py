@@ -45,6 +45,8 @@ OVERS_ENABLED = os.getenv("OVERS_ENABLED", "false").lower() in ("true", "1", "ye
 # While overs are off, paper-track the overs the raw model would bet
 # (shadow_picks table; `python main.py shadow_stats`). No alerts, no stakes.
 SHADOW_OVERS_ENABLED = os.getenv("SHADOW_OVERS_ENABLED", "true").lower() in ("true", "1", "yes")
+# Windows: keep the PC from idle-sleeping while the scheduler runs (src/utils/keep_awake.py).
+KEEP_AWAKE = os.getenv("KEEP_AWAKE", "true").lower() in ("true", "1", "yes")
 # Prop stake sizing: "flat" stakes BANKROLL * FLAT_STAKE_PCT on every play;
 # "kelly" scales by estimated edge. Flat while edge size shows no relation to
 # hit rate (13%+ edges hit exactly at implied through 2026-10-26).
