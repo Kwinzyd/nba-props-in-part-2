@@ -42,7 +42,7 @@ from src.clients.injuries import InjuryClient
 from src.clients.telegram_bot import TelegramBotClient
 from src.config import (
     PROP_MARKETS, ALT_PROP_MARKETS, ALT_TO_BASE_MARKET,
-    EDGE_MIN, REC_BOOKS, SHARP_EDGE_MIN,
+    EDGE_MIN, REC_BOOKS, SHARP_BOOKS, SHARP_EDGE_MIN,
     PLAYOFF_EDGE_MIN, PLAYOFF_SHARP_EDGE_MIN,
     CONSENSUS_BOOKS, CONSENSUS_HOLD_MAX,
     BDL_ENABLED, BDL_PROP_VENDORS,
@@ -74,6 +74,7 @@ from src.models.edge_ranker import (
 )
 from src.models.calibration_model import calibrate_candidates
 from src.pipelines.sharp_picks import record_sharp_pick
+from src.pipelines.candidate_log import record_candidates
 from src.pipelines.shadow_overs import record_shadow_overs
 from src.models.ml_model import get_ml_projection
 from src.pipelines.send_alerts import evaluate_and_alert, send_game_market_alert, send_line_disagreement_alert
@@ -466,6 +467,59 @@ def _rec_bookmakers(bookmakers: List[Dict]) -> List[Dict]:
     rec_lower = {b.lower() for b in REC_BOOKS}
     return [b for b in bookmakers
             if (b.get('key') or '').lower() in rec_lower or (b.get('title') or '').lower() in rec_lower]
+
+
+def _best_rec_odds(line_records: List[tuple]) -> Dict[tuple, dict]:
+    """
+    Best price per (player, market, line, side) among REC_BOOKS only, from
+    BDL line records (player, market, book, line, side, price, implied).
+    Same shape as the bridge's best_odds, which spans every pulled vendor.
+    """
+    rec_lower = {b.lower() for b in REC_BOOKS}
+    best: Dict[tuple, dict] = {}
+    for name, market, book, line, side, price, _ in line_records:
+        if str(book).lower() not in rec_lower or not price:
+            continue
+        key = (name, market, line, side)
+        if key not in best or price > best[key]["price"]:
+            best[key] = {"price": price, "book": book}
+    return best
+
+
+def _sharp_line_records(sharp_bookmakers: List[Dict]) -> List[tuple]:
+    """line_history rows for the sharp books in an Odds API response (rec books come from BDL)."""
+    sharp_lower = {b.lower() for b in SHARP_BOOKS} | set(CONSENSUS_BOOKS)
+    records = []
+    for book in sharp_bookmakers:
+        key = (book.get('key') or '').lower()
+        if key not in sharp_lower and (book.get('title') or '').lower() not in sharp_lower:
+            continue
+        for mkt in book.get('markets', []):
+            for o in mkt.get('outcomes', []):
+                price, point = float(o.get('price') or 0), o.get('point')
+                if price > 1.0 and point is not None and o.get('description'):
+                    records.append((o['description'], mkt.get('key'), key, float(point),
+                                    str(o.get('name', '')).upper(), price, 1.0 / price))
+    return records
+
+
+# event_id -> fingerprint of the sharp prices last written to line_history,
+# so cached Odds API responses aren't stored again under a new timestamp.
+_SHARP_LH_SEEN: Dict[str, int] = {}
+
+
+def _store_sharp_lines(db, event_id: str, sharp_bookmakers: List[Dict]) -> None:
+    """Persist sharp-book prices (Pinnacle etc.) to line_history so sharp-vs-rec can be backtested."""
+    try:
+        records = _sharp_line_records(sharp_bookmakers)
+        fingerprint = hash(tuple(records))
+        if not records or _SHARP_LH_SEEN.get(event_id) == fingerprint:
+            return
+        db.insert_line_history_batch(records)
+        _SHARP_LH_SEEN[event_id] = fingerprint
+        logger.info(f"Sharp lines: stored {len(records)} price(s) for {event_id}")
+    except Exception as e:
+        logger.warning(f"Sharp lines: line_history write failed for {event_id}: {e}")
 
 
 def _american(decimal_odds: float) -> str:
@@ -883,7 +937,7 @@ def scan_props():
             bdl_data = _bdl_bridge.get_props_for_game(bdl_game_id, vendors=BDL_PROP_VENDORS)
             players_in_event = bdl_data["players_in_event"]
             prices_by_market = bdl_data["prices_by_market"]
-            bdl_best_odds    = bdl_data["best_odds"]
+            bdl_best_odds    = _best_rec_odds(bdl_data["line_records"])
             bdl_player_map   = bdl_data["player_id_map"]
 
             if bdl_player_map:
@@ -913,6 +967,7 @@ def scan_props():
                         caller='scan',
                     )
                     sharp_bookmakers = sharp_odds.get('bookmakers', [])
+                    _store_sharp_lines(db, event_id, sharp_bookmakers)
                 except OddsApiQuotaError as _qe:
                     # A refused budget request costs nothing; later games may still fit.
                     if not isinstance(_qe, OddsApiBudgetError):
@@ -2259,6 +2314,10 @@ def scan_props():
         record_shadow_overs(candidates, db)
     except Exception as e:
         logger.warning(f"Shadow overs: recording failed: {e}")
+    try:
+        record_candidates(candidates, db)
+    except Exception as e:
+        logger.warning(f"Candidate log: recording failed: {e}")
 
     logger.info(
         f"Scan complete: {len(candidates)} candidates, {len(actionable)} actionable edges. "

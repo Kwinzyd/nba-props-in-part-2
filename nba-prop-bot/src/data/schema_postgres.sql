@@ -512,6 +512,39 @@ CREATE TABLE IF NOT EXISTS shadow_picks (
     UNIQUE (game_date, player_name, market, line, side)
 );
 
+-- Every prop candidate the scan evaluated (src/pipelines/candidate_log.py),
+-- one row per prop side per day, refreshed each scan until tip, graded
+-- nightly. Lets the model be scored against the market on every prop, not
+-- just the ones it bet.
+CREATE TABLE IF NOT EXISTS scan_candidates (
+    id                BIGSERIAL PRIMARY KEY,
+    first_seen_at     TIMESTAMPTZ DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ DEFAULT NOW(),
+    game_date         TEXT    NOT NULL,
+    event_id          TEXT,
+    player_name       TEXT    NOT NULL,
+    market            TEXT    NOT NULL,
+    line              REAL    NOT NULL,
+    side              TEXT    NOT NULL,
+    book              TEXT,
+    odds              REAL    NOT NULL,
+    implied_prob      REAL,   -- devigged from the best DK/FD over+under
+    raw_model_prob    REAL,
+    model_prob        REAL,   -- calibrated
+    projected_mean    REAL,
+    projected_minutes REAL,
+    injury_status     TEXT,
+    sharp_over_prob   REAL,   -- devigged sharp consensus P(over), if fetched
+    consensus_label   TEXT,
+    hours_to_tipoff   REAL,
+    edge              REAL,
+    actual_result     REAL,
+    won               BOOLEAN,
+    push              BOOLEAN,
+    settled_at        TIMESTAMPTZ,
+    UNIQUE (game_date, player_name, market, line, side)
+);
+
 -- Sharp Alerts: rec-book prices beating the devigged sharp consensus
 -- (src/pipelines/sharp_picks.py). Paper-tracked and graded, no stakes.
 CREATE TABLE IF NOT EXISTS sharp_picks (

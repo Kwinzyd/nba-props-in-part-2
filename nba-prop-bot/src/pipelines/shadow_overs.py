@@ -59,7 +59,7 @@ def record_shadow_overs(candidates: List[dict], db) -> int:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (game_date, player_name, market, line, side) DO NOTHING
                 """,
-                (p.get('game_date'), p.get('event_id'), p.get('player_name'), p.get('market'),
+                (p.get('game_date'), p.get('event_id'), p.get('player_id'), p.get('market'),
                  p.get('line'), 'OVER', p.get('book'), p.get('odds'), p.get('implied_prob'),
                  p.get('raw_model_prob'), p.get('model_prob_calibrated'), p.get('edge'),
                  p.get('edge_min_applied'), p.get('hours_to_tipoff')),
@@ -71,7 +71,8 @@ def record_shadow_overs(candidates: List[dict], db) -> int:
 
 
 # Paper-pick tables sharing this grading/report code (same core columns).
-PAPER_TABLES = {'shadow_picks': 'Shadow overs', 'sharp_picks': 'Sharp picks'}
+PAPER_TABLES = {'shadow_picks': 'Shadow overs', 'sharp_picks': 'Sharp picks',
+                'scan_candidates': 'Scan candidates'}
 
 
 def _check_table(table: str) -> str:

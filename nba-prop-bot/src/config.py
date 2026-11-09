@@ -49,6 +49,9 @@ SHADOW_OVERS_ENABLED = os.getenv("SHADOW_OVERS_ENABLED", "true").lower() in ("tr
 # no edge beyond the market, so the "edges" multiply book hold; the same
 # parlay was also re-sent every scan and none were graded.
 PARLAYS_ENABLED = os.getenv("PARLAYS_ENABLED", "false").lower() in ("true", "1", "yes")
+# Store every scanned prop side (scan_candidates) to score the model against
+# the market on all props, not just alerts (`python main.py model_eval`).
+CANDIDATE_LOG_ENABLED = os.getenv("CANDIDATE_LOG_ENABLED", "true").lower() in ("true", "1", "yes")
 # Windows: keep the PC from idle-sleeping while the scheduler runs (src/utils/keep_awake.py).
 KEEP_AWAKE = os.getenv("KEEP_AWAKE", "true").lower() in ("true", "1", "yes")
 # Prop stake sizing: "flat" stakes BANKROLL * FLAT_STAKE_PCT on every play;
@@ -165,9 +168,10 @@ BDL_ENABLED = bool(BDL_API_KEY)
 # calls per game on them, feeding the rate limiting. Enable only together
 # with a parser fix and a retrain on the same features.
 BDL_PROFILES_ENABLED = os.getenv("BDL_PROFILES_ENABLED", "false").lower() in ("true", "1", "yes")
-# BDL vendors to pull prop lines from — the books alerts are priced at, so
-# only books the user can bet (REC_BOOKS). Sharp pricing still from Odds API.
-BDL_PROP_VENDORS_RAW = os.getenv("BDL_PROP_VENDORS", REC_BOOKS_RAW)
+# BDL vendors to pull prop lines from (all go to line_history for market
+# data). Alerts are priced only at REC_BOOKS, the books the user can bet.
+# Sharp pricing still from Odds API.
+BDL_PROP_VENDORS_RAW = os.getenv("BDL_PROP_VENDORS", "draftkings,fanduel,caesars,betmgm")
 BDL_PROP_VENDORS = [v.strip() for v in BDL_PROP_VENDORS_RAW.split(",") if v.strip()]
 # When BDL is active, reduce Odds API scan frequency (only needed for Pinnacle)
 BDL_SHARP_SCAN_INTERVAL = int(os.getenv("BDL_SHARP_SCAN_INTERVAL", "30"))  # minutes

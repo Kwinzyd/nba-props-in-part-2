@@ -35,6 +35,11 @@ def main():
     sharp_parser = subparsers.add_parser("sharp_stats", help="Show paper-tracked Sharp Alerts (DK/FD vs devigged sharp)")
     sharp_parser.add_argument("--since", help="Only include picks on/after this date")
 
+    # model_eval command
+    eval_parser = subparsers.add_parser("model_eval", help="Score the raw model against the market on every scanned prop")
+    eval_parser.add_argument("--since", help="Only include props on/after this date")
+    eval_parser.add_argument("--edge-min", type=float, default=0.05, help="Raw edge vs break-even for 'model picks'")
+
     # Phase 4 Commands
     cal_parser = subparsers.add_parser("calibration", help="Check probability calibration and Brier score")
     tune_parser = subparsers.add_parser("tune", help="Run hyperparameter tuning grid search")
@@ -97,6 +102,10 @@ def main():
         from src.pipelines.shadow_overs import shadow_report
         from src.data.db import get_db_client
         shadow_report(get_db_client(), since=args.since, table='sharp_picks')
+    elif args.command == "model_eval":
+        from src.pipelines.candidate_log import model_eval_report
+        from src.data.db import get_db_client
+        model_eval_report(get_db_client(), since=args.since, edge_min=args.edge_min)
     elif args.command == "calibration":
         from src.pipelines.calibration import check_calibration
         check_calibration()

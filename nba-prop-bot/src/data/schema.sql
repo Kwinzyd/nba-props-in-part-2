@@ -430,6 +430,35 @@ CREATE TABLE IF NOT EXISTS shadow_picks (
     UNIQUE (game_date, player_name, market, line, side)
 );
 
+CREATE TABLE IF NOT EXISTS scan_candidates (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    first_seen_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
+    game_date         TEXT    NOT NULL,
+    event_id          TEXT,
+    player_name       TEXT    NOT NULL,
+    market            TEXT    NOT NULL,
+    line              REAL    NOT NULL,
+    side              TEXT    NOT NULL,
+    book              TEXT,
+    odds              REAL    NOT NULL,
+    implied_prob      REAL,
+    raw_model_prob    REAL,
+    model_prob        REAL,
+    projected_mean    REAL,
+    projected_minutes REAL,
+    injury_status     TEXT,
+    sharp_over_prob   REAL,
+    consensus_label   TEXT,
+    hours_to_tipoff   REAL,
+    edge              REAL,
+    actual_result     REAL,
+    won               BOOLEAN,
+    push              BOOLEAN,
+    settled_at        DATETIME,
+    UNIQUE (game_date, player_name, market, line, side)
+);
+
 CREATE TABLE IF NOT EXISTS sharp_picks (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,

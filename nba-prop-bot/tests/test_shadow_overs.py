@@ -29,7 +29,7 @@ class _Db:
 def _cand(side='OVER', raw=0.62, cal=0.53, odds=1.90, hours=2.0, player='Jalen Green'):
     return {'side': side, 'raw_model_prob': raw, 'model_prob': cal, 'odds': odds,
             'implied_prob': 1 / odds, 'hours_to_tipoff': hours, 'market': 'player_points',
-            'line': 20.5, 'player_name': player, 'book': 'draftkings',
+            'line': 20.5, 'player_id': player, 'book': 'draftkings',
             'game_date': '2026-11-08', 'event_id': 'ev1', 'projected_minutes': 32,
             'mean': 0, 'calibrated': True}
 
