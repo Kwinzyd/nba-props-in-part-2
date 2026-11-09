@@ -70,25 +70,37 @@ def record_shadow_overs(candidates: List[dict], db) -> int:
     return new
 
 
-def unsettled_shadow_dates(db, start: str, end: str) -> List[str]:
+# Paper-pick tables sharing this grading/report code (same core columns).
+PAPER_TABLES = {'shadow_picks': 'Shadow overs', 'sharp_picks': 'Sharp picks'}
+
+
+def _check_table(table: str) -> str:
+    if table not in PAPER_TABLES:
+        raise ValueError(f"not a paper-pick table: {table}")
+    return table
+
+
+def unsettled_shadow_dates(db, start: str, end: str, table: str = 'shadow_picks') -> List[str]:
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT DISTINCT game_date FROM shadow_picks "
+            f"SELECT DISTINCT game_date FROM {_check_table(table)} "
             "WHERE settled_at IS NULL AND game_date BETWEEN ? AND ? ORDER BY 1",
             (start, end),
         ).fetchall()
     return [str(r['game_date']) for r in rows]
 
 
-def settle_shadow_picks(db, target_date: str, find_stat_row, grade_prop) -> int:
+def settle_shadow_picks(db, target_date: str, find_stat_row, grade_prop,
+                        table: str = 'shadow_picks') -> int:
     """
-    Grade shadow picks for target_date. find_stat_row(player_name) returns the
+    Grade paper picks for target_date. find_stat_row(player_name) returns the
     player's final box-score row or None; grade_prop is settle_results'
-    _grade_prop. Picks with no stat row (DNP, game not final) stay ungraded.
+    _grade_prop. Picks with no stat row (game not final) stay ungraded.
     """
+    label = PAPER_TABLES[_check_table(table)]
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, player_name, market, line, side FROM shadow_picks "
+            f"SELECT id, player_name, market, line, side FROM {table} "
             "WHERE settled_at IS NULL AND game_date = ?",
             (target_date,),
         ).fetchall()
@@ -100,21 +112,22 @@ def settle_shadow_picks(db, target_date: str, find_stat_row, grade_prop) -> int:
         won, actual = grade_prop(r['market'], float(r['line']), r['side'], stat_row)
         with db.get_conn() as conn:
             conn.execute(
-                "UPDATE shadow_picks SET actual_result = ?, won = ?, push = ?, settled_at = CURRENT_TIMESTAMP "
+                f"UPDATE {table} SET actual_result = ?, won = ?, push = ?, settled_at = CURRENT_TIMESTAMP "
                 "WHERE id = ?",
                 (actual, bool(won) if won is not None else False, won is None, r['id']),
             )
         graded += 1
     if rows:
-        logger.info(f"Shadow overs: graded {graded}/{len(rows)} paper pick(s) for {target_date}.")
+        logger.info(f"{label}: graded {graded}/{len(rows)} paper pick(s) for {target_date}.")
     return graded
 
 
-def shadow_report(db, since: Optional[str] = None) -> Dict[str, dict]:
+def shadow_report(db, since: Optional[str] = None, table: str = 'shadow_picks') -> Dict[str, dict]:
     """Print and return hit rate vs break-even and flat-stake ROI, overall and by market."""
+    label = PAPER_TABLES[_check_table(table)]
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT market, odds, won, edge FROM shadow_picks "
+            f"SELECT market, odds, won, edge FROM {table} "
             "WHERE settled_at IS NOT NULL AND NOT push AND game_date >= ?",
             (since or '0000-00-00',),
         ).fetchall()
@@ -122,7 +135,7 @@ def shadow_report(db, since: Optional[str] = None) -> Dict[str, dict]:
     for r in rows:
         groups.setdefault(r['market'], []).append(r)
     out = {}
-    print(f"Shadow overs (graded, excl. pushes){' since ' + since if since else ''}:")
+    print(f"{label} (graded, excl. pushes and voids){' since ' + since if since else ''}:")
     for name, rs in groups.items():
         n = len(rs)
         if not n:

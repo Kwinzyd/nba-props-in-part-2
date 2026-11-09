@@ -73,6 +73,7 @@ from src.models.edge_ranker import (
     set_playoff_mode as set_ranker_playoff_mode,
 )
 from src.models.calibration_model import calibrate_candidates
+from src.pipelines.sharp_picks import record_sharp_pick
 from src.pipelines.shadow_overs import record_shadow_overs
 from src.models.ml_model import get_ml_projection
 from src.pipelines.send_alerts import evaluate_and_alert, send_game_market_alert, send_line_disagreement_alert
@@ -458,6 +459,13 @@ def get_best_odds(bookmakers: List[Dict], player_name: str,
                 elif side == 'under' and price > best_under['price']:
                     best_under = {"price": price, "book": book['title']}
     return best_over, best_under
+
+
+def _rec_bookmakers(bookmakers: List[Dict]) -> List[Dict]:
+    """Only the REC_BOOKS entries (Odds API key or title) — the books the user bets."""
+    rec_lower = {b.lower() for b in REC_BOOKS}
+    return [b for b in bookmakers
+            if (b.get('key') or '').lower() in rec_lower or (b.get('title') or '').lower() in rec_lower]
 
 
 def _american(decimal_odds: float) -> str:
@@ -2078,23 +2086,16 @@ def scan_props():
                         closeout_game=bool(proj.get('closeout_opportunity', False)),
                     )
 
-                    # ── Get best odds (BDL primary, Odds API for sharp) ───
+                    # ── Get best odds at the books the user can bet ───────
+                    # Sharp books are the fair-price reference only, never
+                    # the price an alert is graded at.
                     if BDL_ENABLED_RUNTIME:
                         best_over, best_under = _get_best_bdl_odds(
                             bdl_best_odds, player_name, mkt, line
                         )
-                        # Also check sharp bookmakers for better price
-                        if sharp_bookmakers:
-                            s_over, s_under = get_best_odds(
-                                sharp_bookmakers, player_name, mkt, line
-                            )
-                            if s_over['price'] > best_over.get('price', 0):
-                                best_over = s_over
-                            if s_under['price'] > best_under.get('price', 0):
-                                best_under = s_under
                     else:
                         best_over, best_under = get_best_odds(
-                            sharp_bookmakers, player_name, mkt, line
+                            _rec_bookmakers(sharp_bookmakers), player_name, mkt, line
                         )
 
                     # Devig
@@ -2196,6 +2197,19 @@ def scan_props():
                             if dedup_key in sharp_alerted:
                                 continue
                             sharp_alerted.add(dedup_key)
+                            try:
+                                _new_sharp = record_sharp_pick(
+                                    db, game_date=game_date, event_id=event_id,
+                                    player_name=player_name, market=base_mkt, line=line,
+                                    side=chk_side, book=rec_book, odds=rec_price,
+                                    fair_prob=true_prob, consensus_label=_consensus_label,
+                                    hours_to_tipoff=_hours_to_tip,
+                                )
+                            except Exception as e:
+                                logger.warning(f"Sharp pick: recording failed: {e}")
+                                _new_sharp = True
+                            if not _new_sharp:
+                                continue  # already alerted on an earlier scan
                             msg = (
                                 f"🔪 <b>Sharp Alert: {player_name} "
                                 f"{chk_side} {line} {mkt_label}</b>\n\n"

@@ -161,8 +161,9 @@ BDL_ENABLED = bool(BDL_API_KEY)
 # calls per game on them, feeding the rate limiting. Enable only together
 # with a parser fix and a retrain on the same features.
 BDL_PROFILES_ENABLED = os.getenv("BDL_PROFILES_ENABLED", "false").lower() in ("true", "1", "yes")
-# BDL vendors to pull prop lines from (rec books — sharp pricing still from Odds API)
-BDL_PROP_VENDORS_RAW = os.getenv("BDL_PROP_VENDORS", "draftkings,fanduel,caesars,betmgm")
+# BDL vendors to pull prop lines from — the books alerts are priced at, so
+# only books the user can bet (REC_BOOKS). Sharp pricing still from Odds API.
+BDL_PROP_VENDORS_RAW = os.getenv("BDL_PROP_VENDORS", REC_BOOKS_RAW)
 BDL_PROP_VENDORS = [v.strip() for v in BDL_PROP_VENDORS_RAW.split(",") if v.strip()]
 # When BDL is active, reduce Odds API scan frequency (only needed for Pinnacle)
 BDL_SHARP_SCAN_INTERVAL = int(os.getenv("BDL_SHARP_SCAN_INTERVAL", "30"))  # minutes

@@ -30,7 +30,11 @@ def main():
     # shadow_stats command
     shadow_parser = subparsers.add_parser("shadow_stats", help="Show paper-tracked overs (while OVERS_ENABLED is off)")
     shadow_parser.add_argument("--since", help="Only include picks on/after this date")
-    
+
+    # sharp_stats command
+    sharp_parser = subparsers.add_parser("sharp_stats", help="Show paper-tracked Sharp Alerts (DK/FD vs devigged sharp)")
+    sharp_parser.add_argument("--since", help="Only include picks on/after this date")
+
     # Phase 4 Commands
     cal_parser = subparsers.add_parser("calibration", help="Check probability calibration and Brier score")
     tune_parser = subparsers.add_parser("tune", help="Run hyperparameter tuning grid search")
@@ -89,6 +93,10 @@ def main():
         from src.pipelines.shadow_overs import shadow_report
         from src.data.db import get_db_client
         shadow_report(get_db_client(), since=args.since)
+    elif args.command == "sharp_stats":
+        from src.pipelines.shadow_overs import shadow_report
+        from src.data.db import get_db_client
+        shadow_report(get_db_client(), since=args.since, table='sharp_picks')
     elif args.command == "calibration":
         from src.pipelines.calibration import check_calibration
         check_calibration()

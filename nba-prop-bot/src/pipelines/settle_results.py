@@ -17,8 +17,9 @@ from typing import Dict, List, Optional, Tuple
 
 from src.data.db import get_db_client
 from src.clients.bdl_client import BDLClient
+from src.clients.bdl_game_logs import _parse_minutes
 from src.clients.telegram_bot import TelegramBotClient
-from src.pipelines.shadow_overs import settle_shadow_picks, unsettled_shadow_dates
+from src.pipelines.shadow_overs import PAPER_TABLES, settle_shadow_picks, unsettled_shadow_dates
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -62,10 +63,13 @@ def _grade_prop(
     Returns (won, actual_value) where won is:
       1    — winning bet
       0    — losing bet
-      None — push (actual == line)
+      None — push (actual == line), or void: the player didn't play
+             (books void DNP props; BDL still returns a 0-minute row)
     """
     stat_key = _MARKET_TO_STAT.get(market)
     if not stat_key:
+        return None, 0.0
+    if 'min' in stat_row and _parse_minutes(stat_row.get('min')) <= 0:
         return None, 0.0
 
     if stat_key == 'pra':
@@ -247,8 +251,8 @@ def settle_alerts(target_date: Optional[str] = None) -> None:
             (target_date,),
         ).fetchall()
 
-    shadow_pending = bool(unsettled_shadow_dates(db, target_date, target_date))
-    if not rows and not shadow_pending:
+    paper_pending = [t for t in PAPER_TABLES if unsettled_shadow_dates(db, target_date, target_date, table=t)]
+    if not rows and not paper_pending:
         logger.info(f"No unsettled bets for {target_date} — nothing to do.")
         return
 
@@ -278,12 +282,14 @@ def settle_alerts(target_date: Optional[str] = None) -> None:
         f"{len(final_stats)} player stat line(s) available"
     )
 
-    # Paper-tracked overs ride on the same box scores; never block real grading.
-    if shadow_pending:
+    # Paper picks (shadow overs, sharp picks) ride on the same box scores;
+    # never block real grading.
+    for table in paper_pending:
         try:
-            settle_shadow_picks(db, target_date, lambda name: _find_stat_row(stat_index, name), _grade_prop)
+            settle_shadow_picks(db, target_date, lambda name: _find_stat_row(stat_index, name),
+                                _grade_prop, table=table)
         except Exception as exc:
-            logger.warning(f"Shadow overs: grading failed for {target_date}: {exc}")
+            logger.warning(f"{PAPER_TABLES[table]}: grading failed for {target_date}: {exc}")
 
     # ── 3. Grade each alert ───────────────────────────────────────────────
     wins = losses = pushes = skipped = 0
@@ -446,7 +452,8 @@ def settle_recent(days: int = 4) -> None:
 
     dates = {r['game_date'].strftime('%Y-%m-%d') if hasattr(r['game_date'], 'strftime') else str(r['game_date'])
              for r in rows}
-    dates.update(unsettled_shadow_dates(db, start, yesterday))
+    for table in PAPER_TABLES:
+        dates.update(unsettled_shadow_dates(db, start, yesterday, table=table))
     for d in sorted(dates):
         settle_alerts(target_date=d)
 
