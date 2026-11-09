@@ -21,7 +21,7 @@ def _book(key, title, market, player, point, price):
 
 class _FakeDb:
     def __init__(self, rows):
-        self.rows, self.updates = rows, {}
+        self.rows, self.updates, self.fair = rows, {}, {}
 
     @contextmanager
     def get_conn(self):
@@ -35,8 +35,10 @@ class _FakeDb:
                 return _R()
         yield _C()
 
-    def update_clv_closing_line(self, track_id, closing, imp_c, imp_a, close_book=None):
+    def update_clv_closing_line(self, track_id, closing, imp_c, imp_a, close_book=None,
+                                close_fair_prob=None):
         self.updates[track_id] = (closing, close_book)
+        self.fair[track_id] = close_fair_prob
 
 
 @pytest.fixture
@@ -56,6 +58,7 @@ def run(monkeypatch):
         monkeypatch.setattr(uc, 'OddsApiClient', _Odds)
         monkeypatch.setattr(uc, '_fetched_events', set())
         uc.update_clv_lines()
+        _run.db = db
         return db.updates
     return _run
 
@@ -83,3 +86,21 @@ def test_no_price_at_alerted_line_records_nothing(run):
         _book('pinnacle', 'Pinnacle', 'player_rebounds', 'Ty Jerome', 4.5, 1.85),
     ])
     assert updates == {}
+
+
+def test_no_vig_close_from_both_sides(run):
+    # Pinnacle closes Under 1.80 / Over 2.05: vigged under = 55.6%, fair = 53.2%.
+    pin = _book('pinnacle', 'Pinnacle', 'player_threes', 'Ajay Mitchell', 1.5, 1.80)
+    pin['markets'][0]['outcomes'].append(
+        {'name': 'Over', 'description': 'Ajay Mitchell', 'point': 1.5, 'price': 2.05})
+    updates = run([_tracker(4, 'Ajay Mitchell', 'player_threes', 1.5, 'DraftKings')], [pin])
+    assert updates == {4: (1.80, 'pinnacle')}
+    fair = run.db.fair[4]
+    assert fair == pytest.approx((1 / 1.80) / (1 / 1.80 + 1 / 2.05))
+    assert fair < 1 / 1.80                 # the vig is removed from our side
+
+
+def test_no_vig_close_missing_when_one_sided(run):
+    run([_tracker(5, 'Ajay Mitchell', 'player_threes', 1.5, 'DraftKings')], [
+        _book('pinnacle', 'Pinnacle', 'player_threes', 'Ajay Mitchell', 1.5, 1.61)])
+    assert run.db.fair[5] is None

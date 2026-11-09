@@ -192,7 +192,11 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
         f"Proj Minutes: {edge_data.get('projected_minutes',  0.0):.1f}\n"
         f"Injury:       {edge_data.get('injury_status', 'Healthy')}\n"
         f"Usage Boost:  {edge_data.get('usage_boost',    0.0):.1%}\n"
-        f"Book Bias:    {edge_data.get('feedback_factor_applied', 1.0):.2f}\n"
+        + (
+            f"Sharp fair:   {edge_data['sharp_fair_prob']:.3f} "
+            f"(break-even {1.0 / float(edge_data.get('odds') or 2.0):.3f})\n"
+            if edge_data.get('sharp_fair_prob') is not None else ""
+        )
         + (
             f"⚡ Line Shift: {edge_data['line_shift_old_line']} → "
             f"{edge_data['line_shift_new_line']} "

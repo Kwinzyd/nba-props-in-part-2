@@ -15,20 +15,22 @@ def generate_analytics(since: str = None):
 
     with db.get_conn() as conn:
         query = f"""
-        SELECT a.id, a.player_name, a.market, a.edge, b.won, b.actual_result,
-               AVG(c.clv) as clv, AVG(c.closing_odds) as closing_odds, a.odds as alert_odds
+        SELECT a.id, a.player_name, a.market, a.edge, b.won, b.push, b.actual_result,
+               AVG(c.clv) as clv, AVG(c.clv_novig) as clv_novig,
+               AVG(c.closing_odds) as closing_odds, a.odds as alert_odds
         FROM alerts_sent a
         JOIN bet_results b ON a.id = b.alert_id
         LEFT JOIN clv_tracking c ON a.id = c.alert_id
         {where}
-        GROUP BY a.id, a.player_name, a.market, a.edge, b.won, b.actual_result, a.odds
+        GROUP BY a.id, a.player_name, a.market, a.edge, b.won, b.push, b.actual_result, a.odds
         """
         df = pd.read_sql_query(query, conn, params=params)
         
+    df = df[df['push'] != True]  # pushes and voided DNPs are no bet
     if df.empty:
         print("No settled data available for analytics.")
         return
-        
+
     total_bets = len(df)
     wins = len(df[df['won'] == True])
     win_rate = wins / total_bets if total_bets > 0 else 0
@@ -51,6 +53,7 @@ def generate_analytics(since: str = None):
     clv_df = df.dropna(subset=['clv'])
     avg_clv = clv_df['clv'].mean() if not clv_df.empty else 0
     clv_hit_rate = len(clv_df[clv_df['clv'] > 0]) / len(clv_df) if not clv_df.empty else 0
+    novig_df = df.dropna(subset=['clv_novig'])
 
     print("\n===========================================")
     print("      NBA PROP BOT MODEL PERFORMANCE       ")
@@ -67,8 +70,12 @@ def generate_analytics(since: str = None):
     if clv_df.empty:
         print("No CLV data populated yet.")
     else:
-        print(f"Average CLV Captured : {avg_clv:.2%}")
+        print(f"Average CLV Captured : {avg_clv:.2%}  (vigged prices, n={len(clv_df)})")
         print(f"Beat Closing Line %  : {clv_hit_rate:.2%}")
+    if not novig_df.empty:
+        # The real test: did the bet price beat the devigged closing line?
+        print(f"No-vig CLV           : {novig_df['clv_novig'].mean():+.2%}  (n={len(novig_df)})")
+        print(f"Beat No-vig Close %  : {(novig_df['clv_novig'] > 0).mean():.2%}")
     print("===========================================\n")
     
 if __name__ == "__main__":

@@ -33,7 +33,7 @@ from typing import Dict, List, Tuple
 from src.data.db import get_db_client
 from src.clients.odds_api import OddsApiClient, OddsApiQuotaError, OddsApiBudgetError
 from src.clients.sportradar_client import SportradarClient
-from src.models.devig import decimal_to_implied_prob
+from src.models.devig import decimal_to_implied_prob, devig_two_way
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -236,15 +236,25 @@ def update_clv_lines() -> None:
 
             implied_closing = decimal_to_implied_prob(closing_price)
             implied_alert   = decimal_to_implied_prob(alert_odds)
+            # No-vig close: devig the close book's two sides. The raw CLV above
+            # compares vigged prices, so it is positive even when the bet only
+            # matched the fair close.
+            opp_side  = 'over' if side_n == 'under' else 'under'
+            opp_price = prices.get((source_book, market, player_n, opp_side, float(line)), 0.0)
+            close_fair_prob = None
+            if opp_price > 1.0:
+                close_fair_prob, _ = devig_two_way(implied_closing, decimal_to_implied_prob(opp_price))
             db.update_clv_closing_line(
                 track_id, closing_price, implied_closing, implied_alert,
-                close_book=source_book,
+                close_book=source_book, close_fair_prob=close_fair_prob,
             )
             updated += 1
+            _novig = (f" | no-vig CLV={close_fair_prob - implied_alert:+.4f}"
+                      if close_fair_prob is not None else "")
             logger.info(
                 f"CLV: {tracker['player']} {market} {tracker['side']} {line} "
                 f"alert={alert_odds:.3f} → close={closing_price:.3f} "
-                f"({source_book}) | CLV={implied_closing - implied_alert:+.4f}"
+                f"({source_book}) | CLV={implied_closing - implied_alert:+.4f}{_novig}"
             )
 
     logger.info(f"CLV update complete: {updated} closing line(s) recorded.")

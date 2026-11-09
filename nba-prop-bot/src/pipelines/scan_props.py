@@ -47,7 +47,7 @@ from src.config import (
     CONSENSUS_BOOKS, CONSENSUS_HOLD_MAX,
     BDL_ENABLED, BDL_PROP_VENDORS,
     ELIMINATION_MODE, ELIMINATION_EDGE_BUMP,
-    MIN_PLAYER_GAMES, BANKROLL, ALERT_LEAD_HOURS, DAILY_RISK_PCT, OVERS_ENABLED,
+    MIN_PLAYER_GAMES, BANKROLL, ALERT_LEAD_HOURS, DAILY_RISK_PCT, OVERS_ENABLED, PARLAYS_ENABLED,
     SHARP_FETCH_HOURS, ODDS_FETCH_ALTS, GAME_MARKETS_ENABLED,
 )
 
@@ -2220,27 +2220,28 @@ def scan_props():
                             )
                             bot.send_message(msg)
 
-        # ── Build Full Team Correlation Matrix for SGPs ───────────────
-        for _t_name, _t_logs in team_player_logs.items():
-            try:
-                from src.models.sgp_correlations import build_full_team_correlation_matrix
-                build_full_team_correlation_matrix(_t_name, _t_logs, db)
-            except Exception as e:
-                logger.warning(f"Failed to build full team correlation matrix for {_t_name}: {e}")
+        # ── SGP correlation matrices (only parlays read them) ─────────
+        if PARLAYS_ENABLED:
+            for _t_name, _t_logs in team_player_logs.items():
+                try:
+                    from src.models.sgp_correlations import build_full_team_correlation_matrix
+                    build_full_team_correlation_matrix(_t_name, _t_logs, db)
+                except Exception as e:
+                    logger.warning(f"Failed to build full team correlation matrix for {_t_name}: {e}")
 
-        # ── Cross-Team Correlations (big-vs-big, empirical in playoffs) ──
-        try:
-            from src.models.sgp_correlations import build_cross_team_correlation_matrix
-            _away_abbr_corr = TEAM_NAME_TO_ABBR.get(away_team, '')
-            build_cross_team_correlation_matrix(
-                home_team, away_team, stats_client, db,
-                home_player_logs=team_player_logs.get(home_team),
-                away_player_logs=team_player_logs.get(away_team),
-                away_abbr=_away_abbr_corr,
-                playoff_mode=PLAYOFF_MODE,
-            )
-        except Exception as e:
-            logger.warning(f"Failed to build cross-team correlation matrix for {home_team} vs {away_team}: {e}")
+            # Cross-team correlations (big-vs-big, empirical in playoffs)
+            try:
+                from src.models.sgp_correlations import build_cross_team_correlation_matrix
+                _away_abbr_corr = TEAM_NAME_TO_ABBR.get(away_team, '')
+                build_cross_team_correlation_matrix(
+                    home_team, away_team, stats_client, db,
+                    home_player_logs=team_player_logs.get(home_team),
+                    away_player_logs=team_player_logs.get(away_team),
+                    away_abbr=_away_abbr_corr,
+                    playoff_mode=PLAYOFF_MODE,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to build cross-team correlation matrix for {home_team} vs {away_team}: {e}")
 
         # ── Per-game alerts ───────────────────────────────────────────
         _game_cands = calibrate_candidates(candidates[_game_cand_start:], playoff_mode=PLAYOFF_MODE)
@@ -2268,9 +2269,10 @@ def scan_props():
     for edge in actionable:
         evaluate_and_alert(edge, db, bot, daily_risk_cap=_daily_budget - _reserved)
 
-    generate_and_alert_combos(actionable, bot, db=db, playoff_mode=PLAYOFF_MODE)
-    generate_four_leg_parlays(actionable, bot, db=db, playoff_mode=PLAYOFF_MODE)
-    generate_slate_ultimate(actionable, bot, db=db, playoff_mode=PLAYOFF_MODE)
+    if PARLAYS_ENABLED:
+        generate_and_alert_combos(actionable, bot, db=db, playoff_mode=PLAYOFF_MODE)
+        generate_four_leg_parlays(actionable, bot, db=db, playoff_mode=PLAYOFF_MODE)
+        generate_slate_ultimate(actionable, bot, db=db, playoff_mode=PLAYOFF_MODE)
 
     if BDL_ENABLED_RUNTIME and _bdl_bridge:
         logger.info(f"BDL requests this scan: {_bdl_bridge.bdl.requests_made}")

@@ -210,6 +210,8 @@ class PostgresDatabaseClient:
                 "ALTER TABLE games ADD COLUMN IF NOT EXISTS sr_id TEXT",
                 "ALTER TABLE line_history ADD COLUMN IF NOT EXISTS game_id TEXT",
                 "ALTER TABLE clv_tracking ADD COLUMN IF NOT EXISTS close_book TEXT",
+                "ALTER TABLE clv_tracking ADD COLUMN IF NOT EXISTS close_fair_prob REAL",
+                "ALTER TABLE clv_tracking ADD COLUMN IF NOT EXISTS clv_novig REAL",
             ]
             for _m in _migrations:
                 try:
@@ -361,17 +363,21 @@ class PostgresDatabaseClient:
 
     def update_clv_closing_line(self, track_id: int, closing_odds: float,
                                 implied_closing: float, implied_alert: float,
-                                close_book: str = None):
+                                close_book: str = None, close_fair_prob: float = None):
         clv = implied_closing - implied_alert
+        # clv_novig > 0: the bet price beat the devigged (fair) close
+        clv_novig = close_fair_prob - implied_alert if close_fair_prob is not None else None
         with self.get_conn() as conn:
             conn.execute(
                 """
                 UPDATE clv_tracking
                 SET closing_odds = %s, implied_closing = %s, implied_alert = %s,
-                    closing_time = NOW(), clv = %s, close_book = %s
+                    closing_time = NOW(), clv = %s, close_book = %s,
+                    close_fair_prob = %s, clv_novig = %s
                 WHERE id = %s
                 """,
-                (closing_odds, implied_closing, implied_alert, clv, close_book, track_id),
+                (closing_odds, implied_closing, implied_alert, clv, close_book,
+                 close_fair_prob, clv_novig, track_id),
             )
 
     def get_per_market_clv(self, days_back: int = 30, min_samples: int = 10) -> Dict[str, float]:

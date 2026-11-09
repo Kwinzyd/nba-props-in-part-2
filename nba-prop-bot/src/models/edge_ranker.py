@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from src.config import (
     MIN_PROJECTED_MINUTES,
     PLAYOFF_MIN_PROJECTED_MINUTES,
@@ -8,7 +8,6 @@ from src.config import (
     ELIMINATION_MODE,
     ELIMINATION_EDGE_BUMP,
 )
-from src.models.distributions import get_probability_distribution
 
 # Priority 7: db is optional — set once from scan_props
 _state: Dict[str, Any] = {'db': None, 'playoff_mode': False}
@@ -137,21 +136,24 @@ def set_playoff_mode(playoff_mode: bool) -> None:
     _state['playoff_mode'] = bool(playoff_mode)
 
 
-def get_market_feedback_factor(market: str, book: Optional[str] = None) -> float:
-    """
-    Priority 7: Per-book/market bias correction from historical bet results.
-    Falls back to 1.0 when fewer than 20 settled bets exist for this combo.
-    """
-    db = _state['db']
-    if db is None:
-        return 1.0
-    try:
-        return db.get_book_market_bias(book or '', market)
-    except Exception:
-        return 1.0
-
-
 def rank_edges(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Filter and rank prop candidates.
+
+    edge         = model_prob - devigged implied prob (what the edge floors use)
+    edge_vs_be   = model_prob - 1/odds, the edge over the price actually paid;
+                   the sort key. Ranking on `edge` let the vig itself count as
+                   edge, so high-hold markets (0.5-line steals/blocks) floated
+                   to the top, and the old ev/(mean*1.25) key favoured
+                   low-count props outright.
+
+    A candidate is dropped when the devigged sharp consensus says its side is
+    below break-even at our price — the sharp market disagrees, so there is no
+    bet. The old multiplicative boosters (steam, stale line, dispersion, sharp
+    book role, consensus x1.15, fragile, per-book bias) were removed on
+    2026-11-09: none was validated, and with k=0 calibration they only
+    reshuffled which market-priced unders got sent.
+    """
     ranked = []
 
     for c in candidates:
@@ -162,135 +164,42 @@ def rank_edges(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         status       = (c.get('injury_status') or 'healthy').lower()
         raw_market   = c.get('market', '')
         market       = ALT_TO_BASE_MARKET.get(raw_market, raw_market)
-        mean         = c.get('mean',   0)
-        line         = c.get('line',   0)
-        side         = c.get('side',   '')
-        var_scale    = c.get('variance_scale', 1.0)
-        book         = c.get('book', '')
+        side         = str(c.get('side', '')).upper()
 
         _min_minutes = PLAYOFF_MIN_PROJECTED_MINUTES if _state.get('playoff_mode') else MIN_PROJECTED_MINUTES
-        if proj_mins < _min_minutes:
+        if proj_mins < _min_minutes or "out" in status:
             continue
+
+        breakeven = 1.0 / odds if odds > 1.0 else 1.0
+
+        # Sharp veto: consensus_prob is the devigged sharp P(over) at this line.
+        consensus_prob = c.get('consensus_prob')
+        if consensus_prob is not None:
+            sharp_fair = consensus_prob if side == 'OVER' else 1.0 - consensus_prob
+            c['sharp_fair_prob'] = sharp_fair
+            if sharp_fair < breakeven:
+                continue
 
         edge = model_prob - implied_prob
-        raw_edge = edge  # preserve pre-booster edge for cap
+        edge_vs_be = model_prob - breakeven
+        ev = model_prob * odds - 1.0
 
-        # Phase 4: Edge Stability Filter
-        # Market-scaled perturbation: low-mean markets (blocks/steals) need
-        # a wider % shift to produce a meaningful absolute change.
-        _FRAGILE_SHIFT = {
-            'player_points': 0.05, 'player_rebounds': 0.08, 'player_assists': 0.08,
-            'player_threes': 0.12, 'player_blocks': 0.15, 'player_steals': 0.15,
-            'player_points_rebounds_assists': 0.05,
-        }
-        c['fragile'] = False
-        if mean > 0 and model_prob > 0 and side:
-            _shift = _FRAGILE_SHIFT.get(market, 0.08)
-            dist_up   = get_probability_distribution(market, mean * (1 + _shift), line, variance_scale=var_scale)
-            dist_down = get_probability_distribution(market, mean * (1 - _shift), line, variance_scale=var_scale)
-
-            prob_up   = dist_up.get(f'prob_{side.lower()}',   model_prob)
-            prob_down = dist_down.get(f'prob_{side.lower()}', model_prob)
-
-            edge_up   = prob_up   - implied_prob
-            edge_down = prob_down - implied_prob
-
-            if (edge > 0 and (edge_up < 0 or edge_down < 0)) or \
-               (edge < 0 and (edge_up > 0 or edge_down > 0)):
-                edge *= 0.70  # fragile edge — reduce by 30%
-                c['fragile'] = True
-
-        # Sharp line shift: boost when sharp books moved in our direction,
-        # penalize when they moved against us.
-        _sharp_shift = c.get('sharp_line_shift')
-        if _sharp_shift and _sharp_shift.get('shift_detected') and edge > 0:
-            _shift_dir = _sharp_shift.get('direction', '')
-            if (side.upper() == 'OVER' and _shift_dir == 'UP') or \
-               (side.upper() == 'UNDER' and _shift_dir == 'DOWN'):
-                edge *= 1.15  # sharp move aligns with our edge
-            elif (side.upper() == 'OVER' and _shift_dir == 'DOWN') or \
-                 (side.upper() == 'UNDER' and _shift_dir == 'UP'):
-                edge *= 0.75  # sharp move contradicts our edge
-
-        # Phase 5: Market Microstructure Adjustments
-        steam      = c.get('steam_flag', False)
-        velocity   = c.get('velocity',   0.0)
-        dispersion = c.get('dispersion', 0.0)
-        book_role  = c.get('book_role', 'neutral')
-
-        if steam and edge > 0:
-            edge *= 1.10  # align with sharp steam
-        elif velocity < -0.02 and edge > 0:
-            edge *= 0.80  # fade anti-steam
-
-        # Real-time stale line: sharp repriced within 2 min, retail hasn't caught up.
-        # In playoffs sharp books suspend markets faster, so a stale timestamp
-        # is more likely a pulled market than a hidden edge — use a smaller boost.
-        if c.get('timestamp_stale') and edge > 0:
-            edge *= 1.10 if _state.get('playoff_mode') else 1.20
-
-        if dispersion > 0.04:
-            edge *= 1.05  # inefficient market
-        elif 0.0 < dispersion < 0.015:
-            edge *= 0.90  # too-tight market
-
-        if book_role == 'sharp':
-            edge *= 1.10  # validated by sharp line
-
-        # Consensus confirmation / contradiction
-        consensus_prob = c.get('consensus_prob')
-        if consensus_prob is not None and edge > 0:
-            # consensus_prob = true P(over); derive consensus edge for this side
-            if side.upper() == 'OVER':
-                consensus_edge = consensus_prob - implied_prob
-            else:
-                consensus_edge = (1.0 - consensus_prob) - implied_prob
-            if consensus_edge > 0.02:
-                edge *= 1.15   # consensus confirms — more confident
-            elif consensus_edge < -0.02:
-                edge *= 0.80   # consensus contradicts — reduce confidence
-
-        # Cap cumulative booster inflation to 30% above raw edge
-        if raw_edge > 0 and edge > raw_edge * 1.30:
-            edge = raw_edge * 1.30
-
-        # Priority 7: Per-book/market bias correction from historical results
-        factor = get_market_feedback_factor(market, book)
-        edge  *= factor
-        ev     = ((model_prob * odds) - 1.0) * factor
-
-        # Injury penalties
+        # Injury penalties (risk of a mid-game exit or minutes cap)
         if "questionable" in status or "gtd" in status:
             edge *= 0.8
-            ev   *= 0.8
+            edge_vs_be *= 0.8
+            ev *= 0.8
         elif "doubtful" in status:
             edge *= 0.5
-            ev   *= 0.5
-        elif "out" in status:
-            continue
+            edge_vs_be *= 0.5
+            ev *= 0.5
 
-        c['edge']                    = edge
-        c['ev']                      = ev
-        c['feedback_factor_applied'] = factor
-        c['edge_min_applied']        = compute_dynamic_edge_min(c.get('hours_to_tipoff', 4.0), market=market)
-
-        # Risk-Adjusted EV (sort key)
-        variance = (mean * 1.25) * var_scale if mean > 0 else 1.0
-        c['risk_adjusted_ev'] = ev / variance if variance > 0 else ev
-
-        # ──────────────────────────────────────────────────────────────────
-        # Under Tax REMOVED.
-        #
-        # Previously applied a 15% penalty to Under risk_adjusted_ev to
-        # offset right-skew in NBA stat distributions. Empirical data
-        # shows the model OVER-projects means in the 55-65% band, meaning
-        # Unders are mechanically more likely to hit than the model thinks.
-        # The tax was filtering out profitable Under picks and contributing
-        # to the parlay loss spiral. Calibration_model.py now handles this
-        # correctly at the probability level.
-        # ──────────────────────────────────────────────────────────────────
+        c['edge']               = edge
+        c['edge_vs_breakeven']  = edge_vs_be
+        c['ev']                 = ev
+        c['edge_min_applied']   = compute_dynamic_edge_min(c.get('hours_to_tipoff', 4.0), market=market)
 
         ranked.append(c)
 
-    ranked.sort(key=lambda x: x.get('risk_adjusted_ev', 0), reverse=True)
+    ranked.sort(key=lambda x: x.get('edge_vs_breakeven', 0), reverse=True)
     return ranked

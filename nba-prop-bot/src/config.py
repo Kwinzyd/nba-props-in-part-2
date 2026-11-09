@@ -45,6 +45,10 @@ OVERS_ENABLED = os.getenv("OVERS_ENABLED", "false").lower() in ("true", "1", "ye
 # While overs are off, paper-track the overs the raw model would bet
 # (shadow_picks table; `python main.py shadow_stats`). No alerts, no stakes.
 SHADOW_OVERS_ENABLED = os.getenv("SHADOW_OVERS_ENABLED", "true").lower() in ("true", "1", "yes")
+# Parlay / SGP / slate-parlay alerts. Off: with k=0 calibration the legs have
+# no edge beyond the market, so the "edges" multiply book hold; the same
+# parlay was also re-sent every scan and none were graded.
+PARLAYS_ENABLED = os.getenv("PARLAYS_ENABLED", "false").lower() in ("true", "1", "yes")
 # Windows: keep the PC from idle-sleeping while the scheduler runs (src/utils/keep_awake.py).
 KEEP_AWAKE = os.getenv("KEEP_AWAKE", "true").lower() in ("true", "1", "yes")
 # Prop stake sizing: "flat" stakes BANKROLL * FLAT_STAKE_PCT on every play;

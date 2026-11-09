@@ -168,6 +168,8 @@ class DatabaseClient:
         (22, "alerts_sent: raw_model_prob", "ALTER TABLE alerts_sent ADD COLUMN raw_model_prob REAL"),
         (23, "alerts_sent: model_prob",     "ALTER TABLE alerts_sent ADD COLUMN model_prob REAL"),
         (24, "clv_tracking: close_book",    "ALTER TABLE clv_tracking ADD COLUMN close_book TEXT"),
+        (25, "clv_tracking: close_fair_prob", "ALTER TABLE clv_tracking ADD COLUMN close_fair_prob REAL"),
+        (26, "clv_tracking: clv_novig",     "ALTER TABLE clv_tracking ADD COLUMN clv_novig REAL"),
     ]
 
     def _migrate_schema(self, conn):
@@ -319,18 +321,21 @@ class DatabaseClient:
             return [dict(r) for r in cursor.fetchall()]
 
     def update_clv_closing_line(self, track_id: int, closing_odds: float, implied_closing: float, implied_alert: float,
-                                close_book: str = None):
+                                close_book: str = None, close_fair_prob: float = None):
         clv = implied_closing - implied_alert
+        clv_novig = close_fair_prob - implied_alert if close_fair_prob is not None else None
         with self.get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
                 UPDATE clv_tracking
                 SET closing_odds = ?, implied_closing = ?, implied_alert = ?,
-                    closing_time = CURRENT_TIMESTAMP, clv = ?, close_book = ?
+                    closing_time = CURRENT_TIMESTAMP, clv = ?, close_book = ?,
+                    close_fair_prob = ?, clv_novig = ?
                 WHERE id = ?
                 """,
-                (closing_odds, implied_closing, implied_alert, clv, close_book, track_id)
+                (closing_odds, implied_closing, implied_alert, clv, close_book,
+                 close_fair_prob, clv_novig, track_id)
             )
 
     def insert_line_history(self, player_name: str, market: str, bookmaker: str,
