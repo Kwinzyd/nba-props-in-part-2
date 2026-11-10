@@ -768,7 +768,8 @@ def start_scheduler():
         # Prime injury cache before first scan so projections see fresh status.
         job_sync_injuries()
         # Attempt an immediate scan if there are games today (non-blocking).
-        if _has_games() and _is_scan_window() and _quota_ok():
+        # No quota gate: like job_scan, it falls back to BDL lines when credits are low.
+        if _has_games() and _is_scan_window():
             _maybe_submit_scan("STARTUP")
 
     logger.info(

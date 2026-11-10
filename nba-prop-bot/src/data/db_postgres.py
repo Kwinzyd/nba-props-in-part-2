@@ -17,6 +17,7 @@ automatically via get_db_client() in db.py.
 """
 
 import os
+import threading
 from contextlib import contextmanager
 from typing import Dict, Optional
 
@@ -56,6 +57,14 @@ def normalize_book(book: Optional[str]) -> str:
     if not book:
         return ''
     return str(book).strip().lower()
+
+
+# DSNs whose schema/migrations already ran in this process. get_db_client() is
+# called by every job, and ALTER TABLE takes an ACCESS EXCLUSIVE lock even when
+# the column exists — re-running it mid-scan queued behind open transactions
+# and froze the scheduler.
+_SCHEMA_READY: set = set()
+_SCHEMA_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +171,13 @@ class PostgresDatabaseClient:
     # ------------------------------------------------------------------
 
     def _init_db(self):
+        with _SCHEMA_LOCK:
+            if self._dsn in _SCHEMA_READY:
+                return
+            self._run_schema()
+            _SCHEMA_READY.add(self._dsn)
+
+    def _run_schema(self):
         schema_path = os.path.join(os.path.dirname(__file__), 'schema_postgres.sql')
         if not os.path.exists(schema_path):
             logger.warning(f"PostgreSQL schema not found at {schema_path}")
@@ -181,7 +197,9 @@ class PostgresDatabaseClient:
         try:
             raw.autocommit = True
             cur = raw.cursor()
-            
+            # Fail a DDL statement rather than wait forever behind a long transaction.
+            cur.execute("SET lock_timeout = '10s'")
+
             for stmt in schema_sql.split(';'):
                 clean_stmt = stmt.strip()
                 if clean_stmt:
@@ -242,6 +260,7 @@ class PostgresDatabaseClient:
                 except Exception as _seq_err:
                     logger.debug(f"Sequence reset skipped for {table}.{col}: {_seq_err}")
 
+            cur.execute("RESET lock_timeout")
             logger.info("PostgreSQL schema initialized.")
         finally:
             raw.autocommit = False
