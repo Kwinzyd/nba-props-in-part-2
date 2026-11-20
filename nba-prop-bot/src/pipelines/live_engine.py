@@ -215,7 +215,7 @@ def _load_pre_game_prob_sync(
             data = sr_client.get_event_odds_oddsapi_format(game_id)
         else:
             try:
-                data = odds_client.get_event_odds(game_id, markets=["h2h"])
+                data = odds_client.get_event_odds(game_id, markets=["h2h"], caller='live')
             except OddsApiQuotaError:
                 logger.warning(f"live_engine: Odds API out of credits for {game_id}. Falling back to Sportradar.")
                 db = get_db_client()

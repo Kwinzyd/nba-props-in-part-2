@@ -2,7 +2,7 @@
 Credit-aware scheduler for the NBA Prop Bot.
 
 Game-day logic:
-  - job_sync() runs at 09:00 ET every day (1 Odds API credit).
+  - job_sync() runs at 09:00 ET every day (0 credits: /events is free).
     It counts today's games and sets _today_game_count.
   - scan_props / update_clv_lines only run on game days (>0 games)
     AND within the 11am–11pm ET window AND quota >= QUOTA_FLOOR.
@@ -14,6 +14,7 @@ Configurable via env vars:
   QUOTA_FLOOR            (default 30)  — pause API jobs below this credit level
 """
 
+import logging
 import os
 import time
 import threading
@@ -29,7 +30,8 @@ from src.clients.odds_api import OddsApiClient
 from src.pipelines.sync_events import sync_events
 from src.pipelines.scan_props import scan_props
 from src.pipelines.update_clv import update_clv_lines
-from src.pipelines.settle_results import settle_alerts
+from src.pipelines.settle_results import settle_recent
+from src.pipelines.shadow_validation import evaluate_experiments
 from src.pipelines.analytics import generate_analytics
 from src.pipelines.calibration import check_calibration
 from src.pipelines.tune import run_tuning
@@ -41,7 +43,7 @@ from src.pipelines.timing_analysis import analyze_timing
 from src.clients.twitter_monitor import TwitterNitterMonitor
 from src.pipelines.breaking_news import check_breaking_news
 from src.pipelines.train_ml import train_ml_models, train_ml_models_clv_feedback
-from src.pipelines.train_calibration import train_isotonic_calibration
+from src.pipelines.train_calibration import train_market_anchored_calibration
 from src.pipelines.flush_alerts import flush_pending_alerts
 from src.pipelines.drift_monitor import check_drift
 from src.models.edge_ranker import reload_clv_thresholds
@@ -53,7 +55,9 @@ from src.pipelines.backup_db import backup_db
 from src.config import (
     SCAN_INTERVAL_MINUTES, QUOTA_FLOOR, TWITTER_POLL_INTERVAL,
     BDL_SHARP_SCAN_INTERVAL, OFF_SEASON, OFF_SEASON_AFTER_SYNCS,
+    SCOUT_LINES_ENABLED, GAME_ARB_ENABLED, KEEP_AWAKE, ML_AUTO_RETRAIN,
 )
+from src.utils.keep_awake import keep_system_awake
 from src.events.bus import get_bus, EventBus
 from src.clients.ws_live_feed import start_live_feed
 from src.pipelines.exchange_arb import run_exchange_arb
@@ -61,8 +65,21 @@ from src.pipelines.game_arb import run_game_arb
 from src.pipelines.sync_sportradar import sync_sportradar_schedule, sync_sportradar_lineups, audit_finished_games
 
 _WATCHDOG_TIMEOUT_SEC = int(os.getenv('WATCHDOG_TIMEOUT_SEC', '300'))  # 5 min default
+# Past these, the watchdog exits the process (code 3) so full_run.bat /
+# run_bot.ps1 restart it. A scan that hangs (e.g. a stuck HTTP call) keeps
+# _scan_in_progress set and silently blocks every later scan — that is what
+# killed all of Oct 28's alerts. Longest healthy scan seen so far: 34 min.
+_WATCHDOG_EXIT_SEC = int(os.getenv('WATCHDOG_EXIT_SEC', '1800'))
+_SCAN_STALL_SEC = int(os.getenv('SCAN_STALL_MIN', '90')) * 60
+# The watchdog wakes every 60s; a gap longer than this means the PC was asleep
+# (every "stall" restart Nov 5–8 matched a Windows sleep/wake, not a hang).
+_SUSPEND_GAP_SEC = 180
 # Minimum seconds between scan submissions to prevent duplicate triggers.
 _SCAN_COOLDOWN_SEC = int(os.getenv('SCAN_COOLDOWN_SEC', '60'))
+# News-triggered scans (breaking news, late scratches, injury events) at most
+# this often. Each one re-buys sharp odds (~20 credits per game in the 4h
+# window); a burst of injury news on Oct 23 fired three within 15 minutes.
+_EVENT_SCAN_COOLDOWN_SEC = int(os.getenv('EVENT_SCAN_COOLDOWN_MIN', '20')) * 60
 
 logger = get_logger(__name__)
 bot    = TelegramBotClient()
@@ -87,11 +104,21 @@ ET = tz.gettz('America/New_York')
 _last_tick: float = 0.0
 # Monotonic timestamp of the last scan submission — used by cooldown guard.
 _last_scan_submit: float = 0.0
+# Same, for news-triggered scans only (_EVENT_SCAN_COOLDOWN_SEC).
+_last_event_scan_submit: float = 0.0
 
 
 # ---------------------------------------------------------------------------
 # In-process watchdog
 # ---------------------------------------------------------------------------
+
+def _stall_ages(now: float, resumed_at: float):
+    """(seconds since the loop ticked, seconds the current scan has run), both
+    measured from no earlier than the last wake from sleep."""
+    stale = now - max(_last_tick, resumed_at)
+    scan_age = now - max(_scan_started_at, resumed_at) if _scan_in_progress else 0.0
+    return stale, scan_age
+
 
 def _start_watchdog():
     """
@@ -101,11 +128,34 @@ def _start_watchdog():
     (tells you the loop hung before Railway caught it).
     """
     def _watch():
+        last_check = time.monotonic()
+        resumed_at = 0.0
         while True:
             time.sleep(60)
+            now = time.monotonic()
+            # monotonic() keeps counting while the PC sleeps, so after a
+            # suspend everything looks stalled. If this thread itself overslept,
+            # the machine was asleep: restart the stall clocks from the wake-up.
+            if now - last_check > _SUSPEND_GAP_SEC:
+                logger.warning(f"Watchdog: system was asleep ~{int((now - last_check) // 60)} min "
+                               f"— not counted as a stall.")
+                resumed_at = now
+            last_check = now
             if _last_tick == 0:
                 continue  # scheduler not yet started
-            stale = time.monotonic() - _last_tick
+            stale, scan_age = _stall_ages(now, resumed_at)
+            if stale > _WATCHDOG_EXIT_SEC or scan_age > _SCAN_STALL_SEC:
+                what = (f"scheduler loop stalled for {int(stale // 60)} min" if stale > _WATCHDOG_EXIT_SEC
+                        else f"scan stuck for {int(scan_age // 60)} min")
+                logger.error(f"Watchdog: {what} — exiting so the bot restarts.")
+                try:
+                    # send_instant times out fast and queues to the outbox,
+                    # so this arrives after the restart if not now.
+                    bot.send_instant(f"⚠️ <b>Watchdog</b>: {what} — restarting the bot.")
+                except Exception:
+                    pass
+                logging.shutdown()
+                os._exit(3)
             if stale > _WATCHDOG_TIMEOUT_SEC:
                 msg = (
                     f"⚠️ <b>Watchdog alert</b>: scheduler loop has not ticked "
@@ -270,20 +320,53 @@ def submit_job(job_name: str, func, *args):
     return _pool.submit(_run)
 
 
+_scan_lock = threading.Lock()
+_scan_in_progress = False
+_scan_started_at = 0.0   # monotonic; read by the watchdog
+
+
+def _run_guarded_scan(label: str, scan_func):
+    global _scan_in_progress, _scan_started_at
+    with _scan_lock:
+        if _scan_in_progress:
+            logger.info(f"Scan [{label}] skipped: another scan is already in progress.")
+            return
+        _scan_in_progress = True
+        _scan_started_at = time.monotonic()
+
+    try:
+        scan_func()
+    finally:
+        with _scan_lock:
+            _scan_in_progress = False
+
+
 def _maybe_submit_scan(label: str) -> bool:
     """
-    Submit a scan job with a cooldown guard to prevent duplicate triggers
+    Submit a scan job with a cooldown guard and in-progress lock to prevent duplicate triggers
     (e.g., Redis event fires at the same time as the direct-call path).
-    Returns True if submitted, False if cooldown is active.
+    Returns True if submitted, False if cooldown is active or another scan is running.
     """
-    global _last_scan_submit
-    now = time.monotonic()
-    if now - _last_scan_submit < _SCAN_COOLDOWN_SEC:
-        remaining = int(_SCAN_COOLDOWN_SEC - (now - _last_scan_submit))
-        logger.info(f"Scan [{label}] skipped: cooldown active ({remaining}s remaining).")
-        return False
-    _last_scan_submit = now
-    submit_job(f"Scan [{label}]", scan_props)
+    global _last_scan_submit, _last_event_scan_submit
+    with _scan_lock:
+        if _scan_in_progress:
+            logger.info(f"Scan [{label}] skipped: another scan is currently in progress.")
+            return False
+        now = time.monotonic()
+        if now - _last_scan_submit < _SCAN_COOLDOWN_SEC:
+            remaining = int(_SCAN_COOLDOWN_SEC - (now - _last_scan_submit))
+            logger.info(f"Scan [{label}] skipped: cooldown active ({remaining}s remaining).")
+            return False
+        is_event = label != 'STARTUP'
+        if is_event and now - _last_event_scan_submit < _EVENT_SCAN_COOLDOWN_SEC:
+            remaining = int(_EVENT_SCAN_COOLDOWN_SEC - (now - _last_event_scan_submit))
+            logger.info(f"Scan [{label}] skipped: news-scan cooldown active ({remaining // 60}m remaining).")
+            return False
+        _last_scan_submit = now
+        if is_event:
+            _last_event_scan_submit = now
+
+    submit_job(f"Scan [{label}]", _run_guarded_scan, label, scan_props)
     return True
 
 
@@ -357,15 +440,20 @@ def job_scan():
         except Exception as e:
             logger.debug(f"Scan summary message failed: {e}")
 
-    # Use the cooldown logic from _maybe_submit_scan but with our custom wrapper
+    # Use the cooldown logic and in-progress lock
     global _last_scan_submit
-    now = time.monotonic()
-    if now - _last_scan_submit < _SCAN_COOLDOWN_SEC:
-        remaining = int(_SCAN_COOLDOWN_SEC - (now - _last_scan_submit))
-        logger.info(f"Scan [SCHEDULED] skipped: cooldown active ({remaining}s remaining).")
-        return
-    _last_scan_submit = now
-    submit_job("Scan [SCHEDULED]", _run_and_summarise)
+    with _scan_lock:
+        if _scan_in_progress:
+            logger.info("Scan [SCHEDULED] skipped: another scan is currently in progress.")
+            return
+        now = time.monotonic()
+        if now - _last_scan_submit < _SCAN_COOLDOWN_SEC:
+            remaining = int(_SCAN_COOLDOWN_SEC - (now - _last_scan_submit))
+            logger.info(f"Scan [SCHEDULED] skipped: cooldown active ({remaining}s remaining).")
+            return
+        _last_scan_submit = now
+
+    submit_job("Scan [SCHEDULED]", _run_guarded_scan, "SCHEDULED", _run_and_summarise)
 
 
 def job_clv():
@@ -394,11 +482,13 @@ def job_breaking_news():
 
 def job_scout_lines():
     """
-    Lightweight line scout: fetches current Pinnacle/rec-book prop lines for
-    games within 4h of tip and writes snapshots to line_history (1 credit/game).
-    Immediately runs steam detection on the fresh data — no need to wait for
-    the next scheduled steam job.
+    Line scout: fetches current Pinnacle/rec-book prop lines for games within
+    4h of tip and writes snapshots to line_history (one credit per prop market
+    per game, ~7). Off unless SCOUT_LINES_ENABLED. Immediately runs steam
+    detection on the fresh data.
     """
+    if not SCOUT_LINES_ENABLED:
+        return
     if not _has_games():
         return
     if not _is_scan_window():
@@ -466,6 +556,14 @@ def job_sync_injuries():
             _maybe_submit_scan("LATE-SCRATCH")
 
 
+def job_telegram_outbox():
+    """Retry Telegram messages that failed to send (outage, timeout)."""
+    try:
+        bot.flush_outbox()
+    except Exception as e:
+        logger.warning(f"Telegram outbox flush failed: {e}")
+
+
 def job_flush_alerts():
     """Send Tier-2 digest (Props / Game Markets / SGPs)."""
     if not _has_games():
@@ -496,9 +594,10 @@ def job_drift_monitor():
 
     if result.get('alarm'):
         logger.warning("Drift ALARM — triggering immediate retrain.")
-        notify("Train Calibration [drift alarm]", train_isotonic_calibration)
+        notify("Train Calibration [drift alarm]", train_market_anchored_calibration)
         reload_calibration_model()
-        notify("Train ML [drift alarm]", train_ml_models)
+        if ML_AUTO_RETRAIN:
+            notify("Train ML [drift alarm]", train_ml_models)
 
 
 def job_backup_db():
@@ -545,7 +644,13 @@ def job_execution_summary():
     logger.info(f"Execution summary: P&L={pnl:.2f}, placed={placed}, win_rate={wr_str}")
 
 
-def job_settle():        notify("Settle",          settle_alerts)
+def job_settle():        notify("Settle",          settle_recent)
+def job_shadow_validation():
+    try:
+        report = evaluate_experiments(get_db_client())
+        logger.info('Prospective model validation: %s', report)
+    except Exception as exc:
+        logger.error('Prospective validation failed closed: %s', exc)
 def job_stats():         notify("Stats",            generate_analytics)
 def job_calibration():   notify("Calibration",      check_calibration)
 def job_tune():          notify("Tune",             run_tuning, get_db_client())
@@ -555,7 +660,7 @@ def job_timing_analysis(): notify("Timing Analysis", analyze_timing)
 def job_train_ml():      notify("Train ML",                  train_ml_models)
 def job_train_clv_ml():  notify("Train ML [CLV Feedback]",   train_ml_models_clv_feedback)
 def job_train_calibration():
-    notify("Train Calibration", train_isotonic_calibration)
+    notify("Train Calibration", train_market_anchored_calibration)
     ok = reload_calibration_model()
     logger.info(f"Calibration model hot-reloaded: {'OK' if ok else 'no model on disk'}")
 
@@ -579,7 +684,10 @@ def job_sr_audit():
 
 
 def job_game_arb():
-    """Compare model win probs vs Kalshi game markets. No-op when KALSHI_API_KEY unset."""
+    """Compare sharp win probs vs Kalshi game markets. Off unless GAME_ARB_ENABLED;
+    no-op when KALSHI_API_KEY unset."""
+    if not GAME_ARB_ENABLED:
+        return
     if not _has_games():
         return
     submit_job("Game Arb", run_game_arb)
@@ -593,6 +701,8 @@ def start_scheduler():
     global _last_tick
     logger.info("Starting NBA Prop Bot scheduler (credit-aware mode)...")
     _start_watchdog()
+    if KEEP_AWAKE:
+        keep_system_awake()   # main thread: held until the process exits
     bot.start_listener(db=get_db_client())
 
     # --- Phase 3A: WebSocket live feed (no-op when LIVE_FEED_WS_URL unset) ---
@@ -621,7 +731,8 @@ def start_scheduler():
     daily("04:15", job_sr_audit,          "Sportradar Audit")   # post-game audit
     daily("04:30", job_execution_summary, "Execution Summary")  # paper P&L recap
     daily("05:00", job_drift_monitor,     "Drift Monitor")      # drift check after settlement
-    schedule.every().day.at("09:00").do(job_sync)               # 1 credit; sets game count + hibernation
+    daily("05:15", job_shadow_validation, "Prospective Validation")
+    schedule.every().day.at("09:00").do(job_sync)               # 0 credits (/events is free); sets game count + hibernation
     daily("09:00", sync_sportradar_schedule, "Sportradar Schedule")
     daily("09:05", job_morning_briefing,  "Morning Briefing")   # subscriber daily briefing
     daily("09:15", job_stats,             "Stats")
@@ -630,15 +741,18 @@ def start_scheduler():
     daily("10:00", job_market_stats,      "Market Stats")
     daily("10:15", job_timing_analysis,   "Timing Analysis")
     schedule.every(6).hours.do(unless_hibernating(job_exposure, "Exposure"))
-    schedule.every().sunday.at("03:00").do(unless_hibernating(job_train_ml, "Train ML"))  # weekly retrain
-    schedule.every(30).days.at("04:00").do(unless_hibernating(job_train_clv_ml, "Train ML [CLV]"))
+    if ML_AUTO_RETRAIN:
+        schedule.every().sunday.at("03:00").do(unless_hibernating(job_train_ml, "Train ML"))  # weekly retrain
+        schedule.every(30).days.at("04:00").do(unless_hibernating(job_train_clv_ml, "Train ML [CLV]"))
+    else:
+        logger.info("ML candidate training off (ML_AUTO_RETRAIN=false); active replacement requires prospective promotion.")
 
     # --- Game-day guarded jobs (skip when no games or outside window) ---
-    schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(job_scan)  # ~11 credits each
-    schedule.every(120).minutes.do(job_clv)                     # ~11 credits each
+    schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(job_scan)  # 1 credit/market/game in SHARP_FETCH_HOURS, cached ODDS_CACHE_MIN
+    schedule.every(5).minutes.do(job_clv)                       # 1 credit/alerted market/game at close (ODDS_CLV_CREDIT_BUDGET)
     schedule.every(20).minutes.do(job_steam)                    # 0 credits (DB only)
     schedule.every(30).minutes.do(job_exchange_arb)             # 0 credits (Kalshi API, no-op when key unset)
-    schedule.every(5).minutes.do(job_game_arb)                  # 0 credits (Kalshi game markets, no-op when key unset)
+    schedule.every(5).minutes.do(job_game_arb)                  # off unless GAME_ARB_ENABLED; 1 credit/game per GAME_ARB_ODDS_TTL_MIN
     schedule.every(TWITTER_POLL_INTERVAL).seconds.do(job_breaking_news)  # 0 credits (Nitter)
     # Injury feed: free (BDL/scrape). Run frequently — late scratches move minutes hard.
     schedule.every(15).minutes.do(unless_hibernating(job_sync_injuries, "Sync Injuries"))
@@ -648,6 +762,8 @@ def start_scheduler():
     # Feeds steam detection with data every BDL_SHARP_SCAN_INTERVAL (default 30 min)
     # rather than every 90 min scan cycle.
     schedule.every(BDL_SHARP_SCAN_INTERVAL).minutes.do(job_scout_lines)
+
+    schedule.every(2).minutes.do(job_telegram_outbox)            # retry failed Telegram sends
 
     # --- Tier-2 digest flushes (Props / Game Markets / SGPs) ---
     schedule.every().day.at("12:00").do(job_flush_alerts)
@@ -660,7 +776,8 @@ def start_scheduler():
         # Prime injury cache before first scan so projections see fresh status.
         job_sync_injuries()
         # Attempt an immediate scan if there are games today (non-blocking).
-        if _has_games() and _is_scan_window() and _quota_ok():
+        # No quota gate: like job_scan, it falls back to BDL lines when credits are low.
+        if _has_games() and _is_scan_window():
             _maybe_submit_scan("STARTUP")
 
     logger.info(

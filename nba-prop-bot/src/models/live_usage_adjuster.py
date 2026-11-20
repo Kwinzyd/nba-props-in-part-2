@@ -104,7 +104,7 @@ class LiveUsageAdjuster:
         team: str,
         roster_player_ids: List[int],
         starters: Optional[Set[int]] = None,
-        season: str = "2024-25",
+        season: Optional[str] = None,
     ) -> None:
         """
         Pre-load on_off_splits and base stats for all players on a team.
@@ -116,6 +116,9 @@ class LiveUsageAdjuster:
             starters: Expected starting 5 IDs (if known).
             season: Season string for splits lookup.
         """
+        if season is None:
+            from src.clients.nba_stats import get_current_nba_season
+            season = get_current_nba_season()
         profiles: Dict[int, PlayerProfile] = {}
 
         for pid in roster_player_ids:

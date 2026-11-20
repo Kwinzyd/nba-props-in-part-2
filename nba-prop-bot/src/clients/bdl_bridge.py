@@ -20,6 +20,7 @@ Usage:
 import time
 from typing import Dict, List, Optional, Set, Any
 from src.clients.bdl_client import BDLClient
+from src.config import BDL_PROFILES_ENABLED
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -122,6 +123,7 @@ class BDLBridge:
         prices_by_market: Dict[str, Dict[str, set]] = {}
         best_odds: Dict[tuple, dict] = {}
         line_records: List[tuple] = []
+        quotes: Dict[tuple, dict] = {}
         player_id_map: Dict[str, int] = {}
 
         # We need player names — resolve from BDL player cache
@@ -143,6 +145,8 @@ class BDLBridge:
             side = prop["side"]
             book = prop["book"]
             price = prop["decimal_odds"]
+            quotes[(name, market, line, side, book.lower())] = {
+                'price': price, 'book': book, 'updated_at': prop.get('updated_at')}
 
             players_in_event.add(name)
             player_id_map[name] = pid
@@ -166,6 +170,7 @@ class BDLBridge:
             "prices_by_market": prices_by_market,
             "best_odds": best_odds,
             "line_records": line_records,
+            "quotes": quotes,
             "player_id_map": player_id_map,
         }
 
@@ -375,6 +380,8 @@ class BDLBridge:
             "avg_pct_pts_paint":    0.0,
         }
         result = dict(defaults)
+        if not BDL_PROFILES_ENABLED:
+            return result
 
         if bdl_player_id in self._profile_cache:
             return self._profile_cache[bdl_player_id]
@@ -441,7 +448,7 @@ class BDLBridge:
         Batch-fetch season profiles for multiple players and store in cache.
         Reduces API calls from O(N) to O(1) per scan.
         """
-        if not player_ids:
+        if not player_ids or not BDL_PROFILES_ENABLED:
             return
         
         # Filter out already cached players
@@ -452,45 +459,65 @@ class BDLBridge:
         logger.info(f"BDL: Prefetching profiles for {len(needed)} players (season {season})")
         import requests
 
-        # Helper to check for 429 and abort prefetch
+        # Helper to check for 429 and abort prefetch while populating default cache
+        def _abort_rate_limited():
+            for pid in needed:
+                if pid not in self._profile_cache:
+                    self._profile_cache[pid] = self._build_profile_from_data(pid, [], None, {}, None)
+
         def _is_rate_limited(e):
-            return "429" in str(e) or isinstance(e, requests.exceptions.RetryError)
+            if "429" in str(e) or isinstance(e, requests.exceptions.RetryError):
+                _abort_rate_limited()
+                return True
+            return False
+
+        active_season = season
 
         # 1. Advanced stats V2
         adv_by_p = {}
         try:
-            adv_rows = self.bdl.get_advanced_stats(player_ids=needed, seasons=[season], period=0)
+            adv_rows = self.bdl.get_advanced_stats(player_ids=needed, seasons=[active_season], period=0)
             for row in adv_rows:
                 pid = row.get("player_id")
                 if pid:
                     adv_by_p.setdefault(pid, []).append(row)
         except Exception as e:
             logger.warning(f"BDL prefetch: advanced stats failed: {e}")
-            if _is_rate_limited(e): return # Abort prefetch if rate limited
+            if _is_rate_limited(e): return
 
-        time.sleep(1.0) # Grace period
+        time.sleep(0.5)
 
         # 2. General/Advanced
         gen_adv_by_p = {}
         try:
-            gen_adv_rows = self.bdl.get_season_averages(season=season, player_ids=needed, category="general", stat_type="advanced")
+            gen_adv_rows = self.bdl.get_season_averages(season=active_season, player_ids=needed, category="general", stat_type="advanced")
             gen_adv_by_p = {row.get("player_id"): row for row in gen_adv_rows if row.get("player_id")}
         except Exception as e:
             if _is_rate_limited(e): return
 
-        time.sleep(1.0)
+        # Opening night / early season check: if 0 advanced stats found for current season, fallback to prior season
+        if not gen_adv_by_p and not adv_by_p and season > 2020:
+            logger.info(f"BDL: No season stats for season {season} (opening night); falling back to {season - 1}")
+            active_season = season - 1
+            try:
+                gen_adv_rows = self.bdl.get_season_averages(season=active_season, player_ids=needed, category="general", stat_type="advanced")
+                gen_adv_by_p = {row.get("player_id"): row for row in gen_adv_rows if row.get("player_id")}
+            except Exception as e:
+                if _is_rate_limited(e): return
+
+        time.sleep(0.5)
 
         # 3. Playtypes
         playtypes = ["prballhandler", "prrollman", "isolation", "spotup", "transition", "postup"]
         pt_data_by_p = {pid: {} for pid in needed}
         for pt in playtypes:
             try:
-                rows = self.bdl.get_season_averages(season=season, player_ids=needed, category="playtype", stat_type=pt)
+                rows = self.bdl.get_season_averages(season=active_season, player_ids=needed, category="playtype", stat_type=pt)
                 for row in rows:
                     pid = row.get("player_id")
                     if pid in pt_data_by_p:
                         pt_data_by_p[pid][pt] = row
-                time.sleep(0.5) # Breath between playtypes
+                time.sleep(0.3)
             except Exception as e:
                 if _is_rate_limited(e): return
                 continue
@@ -498,7 +525,7 @@ class BDLBridge:
         # 4. Tracking/Drives
         drives_by_p = {}
         try:
-            drives_rows = self.bdl.get_season_averages(season=season, player_ids=needed, category="tracking", stat_type="drives")
+            drives_rows = self.bdl.get_season_averages(season=active_season, player_ids=needed, category="tracking", stat_type="drives")
             drives_by_p = {row.get("player_id"): row for row in drives_rows if row.get("player_id")}
         except Exception as e:
             if _is_rate_limited(e): return

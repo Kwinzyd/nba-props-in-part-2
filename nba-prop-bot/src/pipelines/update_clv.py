@@ -1,46 +1,59 @@
 """
 CLV Closing Line Capture.
 
-For each unsettled CLV tracker whose game is in the tip-off window
-(up to 90 minutes past scheduled start), fetches the Pinnacle / Circa /
-Bookmaker closing price and saves the CLV delta.
+For each unsettled CLV tracker whose game is about to tip, fetches the
+Pinnacle / Circa / Bookmaker closing price and saves the CLV delta.
 
-Key improvements over v1:
-  • Event-targeted  — one API call per event (not one per player).
+  • Event-targeted  — one API call per event (not one per player), only for
+                      the markets that were alerted.
+  • Once per event  — the first run inside the closing window fetches the
+                      line; later runs skip the event so credits aren't
+                      re-spent on trackers with no sharp price.
   • Pinnacle-first  — sharp books in priority order; Pinnacle is the gold
                       standard closing line signal.
-  • Tip-off gate    — only processes events within a 10-min pre-game to
-                      90-min post-start window; ignores events far in
-                      the future or clearly finished.
+  • Same-book fallback — sharp books don't post steals/blocks and often hang
+                      a different line, so without a sharp price we compare
+                      against the alerted book's own close (same response, no
+                      extra credits). clv_tracking.close_book records which.
+  • Same line only  — a closing price is only comparable when the sharp
+                      book still hangs the alerted line.
   • JOIN enrichment — joins clv_tracking with alerts_sent to retrieve the
-                      event_id without a schema change.
+                      event_id and line without a schema change.
 
-Credits per run: 1 (get_events) + N per tipping event (typically 1–3).
+Credits per run: 0 (get_events is free) + 1 per alerted market per tipping
+event, charged to the separate ODDS_CLV_CREDIT_BUDGET allowance.
 
-Schedule: every 30 minutes on game days (see run_scheduler.py).
+Schedule: every 5 minutes on game days (see run_scheduler.py), so each game
+gets a run inside the closing window.
 """
 
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple
 
 from src.data.db import get_db_client
-from src.clients.odds_api import OddsApiClient, OddsApiQuotaError
+from src.clients.odds_api import OddsApiClient, OddsApiQuotaError, OddsApiBudgetError
 from src.clients.sportradar_client import SportradarClient
-from src.models.devig import decimal_to_implied_prob
+from src.models.devig import decimal_to_implied_prob, devig_two_way
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
 # ── Timing window ─────────────────────────────────────────────────────────────
-# Capture closing lines from 10 minutes before scheduled tip-off until 90
-# minutes after.  After 90 minutes the game is usually well into the second
-# half and Pinnacle may have suspended prop markets.
-_WINDOW_FUTURE = timedelta(minutes=10)   # how far ahead of tip-off we may grab
-_WINDOW_PAST   = timedelta(minutes=90)   # how far past tip-off we still try
+# Capture closing lines from 12 minutes before scheduled tip-off until 10
+# minutes after (sharp books pull props once the game is live; the tail only
+# covers a run delayed by a busy job pool).
+_WINDOW_FUTURE = timedelta(minutes=12)   # how far ahead of tip-off we may grab
+_WINDOW_PAST   = timedelta(minutes=10)   # how far past tip-off we still try
 
-# Sharp books in priority order.  Pinnacle is the only globally-accepted
-# closing-line benchmark; Circa and Bookmaker are used as fallbacks.
-_SHARP_PRIORITY = ['pinnacle', 'circa', 'bookmaker', 'betonlineag']
+# Trackers older than this belong to games long settled (or to old seasons).
+_TRACKER_MAX_AGE = '2 days'
+
+# Sharp books in priority order (Odds API bookmaker keys).  Pinnacle is the
+# only globally-accepted closing-line benchmark; the rest are fallbacks.
+_SHARP_PRIORITY = ['pinnacle', 'circasports', 'bookmaker', 'betonlineag']
+
+# Events whose closing line was already fetched by this process.
+_fetched_events: set = set()
 
 
 def _norm(s: str) -> str:
@@ -55,43 +68,46 @@ def update_clv_lines() -> None:
     db          = get_db_client()
     odds_client = OddsApiClient()
 
-    # ── 1. Pull unsettled trackers + event context ────────────────────────
+    # ── 1. Pull recent unsettled trackers + event context ─────────────────
     # JOIN with alerts_sent so we can group by event_id without a schema change.
     with db.get_conn() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT ct.id              AS track_id,
                    ct.player_id       AS player,
                    ct.market,
                    ct.side,
                    ct.alert_odds,
                    a.event_id,
+                   a.line,
+                   a.book,
                    a.game_date
             FROM   clv_tracking ct
             LEFT   JOIN alerts_sent a ON a.id = ct.alert_id
             WHERE  ct.closing_odds IS NULL
+              AND  ct.alert_time >= NOW() - INTERVAL '{_TRACKER_MAX_AGE}'
             ORDER  BY ct.alert_time
             """
         ).fetchall()
 
     if not rows:
-        logger.info("CLV: no unsettled trackers.")
+        logger.debug("CLV: no unsettled trackers.")
         return
 
     # ── 2. Group by event_id ──────────────────────────────────────────────
     by_event: Dict[str, List[dict]] = {}
     for row in rows:
         eid = row['event_id']
-        if eid:
+        if eid and eid not in _fetched_events:
             by_event.setdefault(eid, []).append(dict(row))
-        else:
+        elif not eid:
             logger.debug(f"CLV: no event_id for {row['player']} {row['market']} — skipping.")
 
     if not by_event:
-        logger.info("CLV: no trackers with event_id found.")
+        logger.debug("CLV: no trackers awaiting a closing line.")
         return
 
-    # ── 3. Fetch upcoming events to check commence times (1 credit) ───────
+    # ── 3. Fetch upcoming events to check commence times (free) ───────────
     try:
         events_list = odds_client.get_events()
     except Exception as exc:
@@ -129,16 +145,16 @@ def update_clv_lines() -> None:
             continue
 
         if age > _WINDOW_PAST:
-            # Game well underway or finished — sharp books have likely
-            # suspended props; odds are stale or unavailable.
+            # Closing window missed — sharp books have pulled props by now.
             logger.info(
                 f"CLV: event {event_id} started "
-                f"{age.total_seconds()/60:.0f}min ago — may be too late."
+                f"{age.total_seconds()/60:.0f}min ago — closing window missed."
             )
-            # Still attempt in case the API still has data.
+            _fetched_events.add(event_id)
+            continue
 
         # One API call per event (not per player)
-        markets_needed = list({t['market'] for t in trackers})
+        markets_needed = sorted({t['market'] for t in trackers})
         try:
             if event_id.startswith("sr:"):
                 logger.info(f"CLV: event_id {event_id} is a Sportradar ID. Fetching directly from Sportradar.")
@@ -149,7 +165,13 @@ def update_clv_lines() -> None:
                     odds_data = odds_client.get_event_odds(
                         event_id=event_id,
                         markets=markets_needed,
+                        caller='clv',
+                        use_cache=False,   # closing line, not the scan's pre-game fetch
                     )
+                except OddsApiBudgetError as exc:
+                    logger.warning(f"CLV: {exc}")
+                    _fetched_events.add(event_id)
+                    continue
                 except OddsApiQuotaError:
                     logger.warning(f"CLV: Odds API out of credits for event {event_id}. Falling back to Sportradar.")
                     with db.get_conn() as conn:
@@ -163,20 +185,25 @@ def update_clv_lines() -> None:
             logger.warning(f"CLV: odds fetch failed for event {event_id}: {exc}")
             continue
 
+        _fetched_events.add(event_id)
         bookmakers = odds_data.get('bookmakers', [])
 
-        # Build lookup: {(book_lower, market_key, player_lower, side_lower): price}
+        # Build lookup: {(book_key, market_key, player_lower, side_lower, point): price}
         prices: Dict[Tuple, float] = {}
         for book in bookmakers:
-            book_key = _norm(book.get('title', ''))
+            # Alerts store either the key ('betmgm') or the title ('Caesars'
+            # for key 'williamhill_us'), so index each book under both.
+            book_ids = {_norm(book.get('key') or ''), _norm(book.get('title') or '')} - {''}
             for mkt in book.get('markets', []):
                 mkt_key = mkt.get('key', '')
                 for outcome in mkt.get('outcomes', []):
                     desc  = _norm(outcome.get('description', ''))  # player name
                     name  = _norm(outcome.get('name', ''))          # OVER/UNDER
                     price = float(outcome.get('price', 0) or 0)
-                    if price > 1.0:
-                        prices[(book_key, mkt_key, desc, name)] = price
+                    point = outcome.get('point')
+                    if price > 1.0 and point is not None:
+                        for book_id in book_ids:
+                            prices[(book_id, mkt_key, desc, name, float(point))] = price
 
         # ── Grade each tracker against the closing price ──────────────────
         for tracker in trackers:
@@ -185,34 +212,49 @@ def update_clv_lines() -> None:
             side_n     = _norm(tracker['side'])
             track_id   = tracker['track_id']
             alert_odds = float(tracker['alert_odds'])
+            line       = tracker['line']
+            if line is None:
+                continue
 
-            # Find sharpest available closing price
+            # Find sharpest available closing price at the alerted line,
+            # else the alerted book's own closing price.
             closing_price = 0.0
             source_book   = ''
-            for sharp in _SHARP_PRIORITY:
-                key = (sharp, market, player_n, side_n)
-                if key in prices and prices[key] > 1.0:
+            for book_id in _SHARP_PRIORITY + [_norm(tracker.get('book') or '')]:
+                key = (book_id, market, player_n, side_n, float(line))
+                if book_id and key in prices:
                     closing_price = prices[key]
-                    source_book   = sharp
+                    source_book   = book_id
                     break
 
             if closing_price <= 1.0:
                 logger.debug(
                     f"CLV: no sharp price for "
-                    f"{tracker['player']} {market} {tracker['side']}"
+                    f"{tracker['player']} {market} {tracker['side']} {line}"
                 )
                 continue
 
             implied_closing = decimal_to_implied_prob(closing_price)
             implied_alert   = decimal_to_implied_prob(alert_odds)
+            # No-vig close: devig the close book's two sides. The raw CLV above
+            # compares vigged prices, so it is positive even when the bet only
+            # matched the fair close.
+            opp_side  = 'over' if side_n == 'under' else 'under'
+            opp_price = prices.get((source_book, market, player_n, opp_side, float(line)), 0.0)
+            close_fair_prob = None
+            if opp_price > 1.0:
+                close_fair_prob, _ = devig_two_way(implied_closing, decimal_to_implied_prob(opp_price))
             db.update_clv_closing_line(
-                track_id, closing_price, implied_closing, implied_alert
+                track_id, closing_price, implied_closing, implied_alert,
+                close_book=source_book, close_fair_prob=close_fair_prob,
             )
             updated += 1
+            _novig = (f" | no-vig CLV={close_fair_prob - implied_alert:+.4f}"
+                      if close_fair_prob is not None else "")
             logger.info(
-                f"CLV: {tracker['player']} {market} {tracker['side']} "
+                f"CLV: {tracker['player']} {market} {tracker['side']} {line} "
                 f"alert={alert_odds:.3f} → close={closing_price:.3f} "
-                f"({source_book}) | CLV={implied_closing - implied_alert:+.4f}"
+                f"({source_book}) | CLV={implied_closing - implied_alert:+.4f}{_novig}"
             )
 
     logger.info(f"CLV update complete: {updated} closing line(s) recorded.")

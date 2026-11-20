@@ -405,3 +405,154 @@ CREATE TABLE IF NOT EXISTS futures_odds (
 );
 
 CREATE INDEX IF NOT EXISTS idx_futures_odds_market ON futures_odds(market_name, timestamp);
+
+CREATE TABLE IF NOT EXISTS shadow_picks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    game_date       TEXT    NOT NULL,
+    event_id        TEXT,
+    player_name     TEXT    NOT NULL,
+    market          TEXT    NOT NULL,
+    line            REAL    NOT NULL,
+    side            TEXT    NOT NULL,
+    book            TEXT,
+    odds            REAL    NOT NULL,
+    implied_prob    REAL,
+    raw_model_prob  REAL,
+    model_prob      REAL,
+    edge            REAL,
+    edge_min        REAL,
+    hours_to_tipoff REAL,
+    actual_result   REAL,
+    won             BOOLEAN,
+    push            BOOLEAN,
+    settled_at      DATETIME,
+    UNIQUE (game_date, player_name, market, line, side)
+);
+
+CREATE TABLE IF NOT EXISTS scan_candidates (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    first_seen_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
+    game_date         TEXT    NOT NULL,
+    event_id          TEXT,
+    player_name       TEXT    NOT NULL,
+    market            TEXT    NOT NULL,
+    line              REAL    NOT NULL,
+    side              TEXT    NOT NULL,
+    book              TEXT,
+    odds              REAL    NOT NULL,
+    implied_prob      REAL,
+    raw_model_prob    REAL,
+    model_prob        REAL,
+    projected_mean    REAL,
+    projected_minutes REAL,
+    injury_status     TEXT,
+    sharp_over_prob   REAL,
+    consensus_label   TEXT,
+    hours_to_tipoff   REAL,
+    edge              REAL,
+    actual_result     REAL,
+    won               BOOLEAN,
+    push              BOOLEAN,
+    settled_at        DATETIME,
+    UNIQUE (game_date, player_name, market, line, side)
+);
+
+CREATE TABLE IF NOT EXISTS selection_rejections (
+    event_id TEXT, player_name TEXT, market TEXT, side TEXT, book TEXT,
+    reason TEXT NOT NULL, recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS sharp_picks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    game_date       TEXT    NOT NULL,
+    event_id        TEXT,
+    player_name     TEXT    NOT NULL,
+    market          TEXT    NOT NULL,
+    line            REAL    NOT NULL,
+    side            TEXT    NOT NULL,
+    book            TEXT,
+    odds            REAL    NOT NULL,
+    fair_prob       REAL,
+    consensus_label TEXT,
+    edge            REAL,
+    hours_to_tipoff REAL,
+    actual_result   REAL,
+    won             BOOLEAN,
+    push            BOOLEAN,
+    settled_at      DATETIME,
+    UNIQUE (game_date, player_name, market, line, side)
+);
+
+-- Sharp line-disagreement alerts: one per player per day (dedup across scans).
+CREATE TABLE IF NOT EXISTS line_disagreement_alerts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    game_date   TEXT NOT NULL,
+    event_id    TEXT,
+    player_name TEXT NOT NULL,
+    market      TEXT NOT NULL,
+    book        TEXT,
+    line        REAL NOT NULL,
+    side        TEXT NOT NULL,
+    odds        REAL,
+    sharp_book  TEXT,
+    sharp_line  REAL,
+    UNIQUE (game_date, player_name)
+);
+
+
+-- Prospective model validation: inputs/predictions never change after recording.
+CREATE TABLE IF NOT EXISTS model_shadow_contexts (context_id TEXT PRIMARY KEY, manifest TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS model_shadow_experiments (
+    experiment_id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL,
+    active_path TEXT NOT NULL,
+    manifest_path TEXT NOT NULL,
+    context_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'collecting',
+    report TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS model_shadow_predictions (
+    prediction_id TEXT PRIMARY KEY,
+    experiment_id TEXT NOT NULL REFERENCES model_shadow_experiments(experiment_id),
+    game_date TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    player_name TEXT NOT NULL,
+    market TEXT NOT NULL,
+    line REAL NOT NULL,
+    side TEXT NOT NULL,
+    snapshot_payload TEXT NOT NULL,
+    snapshot_hash TEXT NOT NULL,
+    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(experiment_id, event_id, player_name, market, line, side)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_prediction_dates ON model_shadow_predictions(game_date);
+CREATE TABLE IF NOT EXISTS model_shadow_results (
+    prediction_id TEXT PRIMARY KEY REFERENCES model_shadow_predictions(prediction_id),
+    actual_result REAL NOT NULL,
+    won BOOLEAN NOT NULL,
+    push BOOLEAN NOT NULL,
+    settled_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS immutable_model_shadow_predictions_update BEFORE UPDATE ON model_shadow_predictions
+BEGIN SELECT RAISE(ABORT, 'Prospective validation records are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_model_shadow_predictions_delete BEFORE DELETE ON model_shadow_predictions
+BEGIN SELECT RAISE(ABORT, 'Prospective validation records are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_model_shadow_results_update BEFORE UPDATE ON model_shadow_results
+BEGIN SELECT RAISE(ABORT, 'Prospective validation records are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_model_shadow_results_delete BEFORE DELETE ON model_shadow_results
+BEGIN SELECT RAISE(ABORT, 'Prospective validation records are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_model_shadow_contexts_update BEFORE UPDATE ON model_shadow_contexts
+BEGIN SELECT RAISE(ABORT, 'Prospective validation records are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS immutable_model_shadow_contexts_delete BEFORE DELETE ON model_shadow_contexts
+BEGIN SELECT RAISE(ABORT, 'Prospective validation records are immutable'); END;

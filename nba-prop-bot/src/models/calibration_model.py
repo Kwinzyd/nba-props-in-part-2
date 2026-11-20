@@ -1,6 +1,23 @@
 """
 Post-hoc probability calibration.
 
+Primary: market-anchored calibration (calibration_market.json, refit nightly
+by train_calibration.train_market_anchored_calibration):
+
+    logit(p) = logit(implied) + k * (logit(raw) - logit(implied)) + b * UNDER
+
+`implied` is 1/odds at the recommended book. k in [0, 1] is how much of the
+model's disagreement with the book is real signal; b is the under/over
+effect. Fit on 280 graded props (Oct 2026): k = 0, b ~ 0.58. The model's
+confidence carried no information beyond the price, unders hit ~8-10 points
+above implied and overs below, and this was the only form that beat the
+market on held-out bets. It replaced per-market isotonic curves that mapped
+raw >= 0.74-0.83 to 0.99.
+
+Props whose raw edge vs the book is below MIN_RAW_EDGE get no edge at all:
+every graded bet the fit came from was one the model already favoured.
+
+Legacy fallback (no anchor file, or no odds): isotonic models / knots below.
 Built from empirical calibration data (206 settled alerts):
 
     Predicted   Actual    Gap
@@ -25,13 +42,42 @@ Usage:
     true_prob = calibrate_prob(model_prob)
 """
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+import json
+import math
 import os
 import joblib
 
 _ISO_MODEL = None
 _ISO_MODEL_LOADED = False
 _ISO_MODEL_PATH = os.path.join(os.path.dirname(__file__), 'calibration_iso.pkl')
+ANCHOR_PATH = os.path.join(os.path.dirname(__file__), 'calibration_market.json')
+_ANCHOR: Optional[Dict[str, Any]] = None
+_ANCHOR_LOADED = False
+MIN_RAW_EDGE = float(os.getenv('MIN_RAW_EDGE', '0.05'))
+
+
+def _get_anchor() -> Optional[Dict[str, Any]]:
+    global _ANCHOR, _ANCHOR_LOADED
+    if not _ANCHOR_LOADED:
+        try:
+            with open(ANCHOR_PATH, encoding='utf-8') as fh:
+                _ANCHOR = json.load(fh)
+        except Exception:
+            _ANCHOR = None
+        _ANCHOR_LOADED = True
+    return _ANCHOR
+
+
+def _logit(p: float) -> float:
+    p = min(max(p, 1e-4), 1 - 1e-4)
+    return math.log(p / (1 - p))
+
+
+def anchored_prob(raw_prob: float, implied: float, is_under: bool, params: Dict[str, Any]) -> float:
+    z = (_logit(implied) + params['k'] * (_logit(raw_prob) - _logit(implied))
+         + params['b_under'] * (1.0 if is_under else 0.0))
+    return 1.0 / (1.0 + math.exp(-z))
 
 
 def _get_iso_model():
@@ -53,11 +99,13 @@ def reload_calibration_model() -> bool:
     process picks it up without a restart.
     Returns True if the model loaded successfully.
     """
-    global _ISO_MODEL, _ISO_MODEL_LOADED
+    global _ISO_MODEL, _ISO_MODEL_LOADED, _ANCHOR, _ANCHOR_LOADED
     _ISO_MODEL_LOADED = False
     _ISO_MODEL = None
+    _ANCHOR_LOADED = False
+    _ANCHOR = None
     model = _get_iso_model()
-    return model is not None
+    return _get_anchor() is not None or model is not None
 
 
 # ── Piecewise calibration knots ────────────────────────────────────────────
@@ -84,7 +132,8 @@ _KNOTS = [
 _PLAYOFF_CALIBRATION_STRENGTH = 0.50
 
 
-def calibrate_prob(raw_prob: float, market: str = 'global', playoff_mode: bool = False) -> float:
+def calibrate_prob(raw_prob: float, market: str = 'global', playoff_mode: bool = False,
+                   implied: Optional[float] = None, side: Optional[str] = None) -> float:
     """
     Map a raw model probability to a calibrated probability using
     piecewise-linear interpolation or market-specific isotonic models.
@@ -94,7 +143,15 @@ def calibrate_prob(raw_prob: float, market: str = 'global', playoff_mode: bool =
         market: the prop market name (e.g. 'player_points') for specific calibration.
         playoff_mode: when True, blend the RS-fit correction with the raw
             probability at _PLAYOFF_CALIBRATION_STRENGTH (default 0.50).
+            Legacy path only.
+        implied / side: book implied probability (1/odds) and 'OVER'/'UNDER'.
+            With both and an anchor file, the market-anchored form is used.
     """
+    anchor = _get_anchor()
+    if anchor is not None and implied is not None and 0.0 < implied < 1.0:
+        p = anchored_prob(raw_prob, implied, str(side or '').upper().startswith('UNDER'), anchor)
+        return float(max(0.01, min(0.99, p)))
+
     models = _get_iso_model()
     calibrated = None
 
@@ -153,8 +210,16 @@ def calibrate_edge_candidate(candidate: Dict[str, Any],
     """
     raw = candidate.get('model_prob', 0.5)
     market = candidate.get('market', 'global')
+    odds = candidate.get('odds') or 0.0
+    implied = 1.0 / odds if odds > 1.0 else None
     candidate['raw_model_prob'] = raw
-    candidate['model_prob'] = calibrate_prob(raw, market=market, playoff_mode=playoff_mode)
+    if implied is not None and _get_anchor() is not None and raw - implied < MIN_RAW_EDGE:
+        # Outside the population the anchor was fit on (model didn't favour it)
+        candidate['model_prob'] = implied
+    else:
+        candidate['model_prob'] = calibrate_prob(
+            raw, market=market, playoff_mode=playoff_mode,
+            implied=implied, side=candidate.get('side'))
     candidate['calibrated'] = True
     return candidate
 

@@ -1,11 +1,11 @@
 import pandas as pd
 from src.data.db import get_db_client
-from src.config import BANKROLL
+from src.config import BANKROLL, DAILY_RISK_PCT, GAME_RISK_PCT
 
 def check_exposure():
     db = get_db_client()
-    MAX_DAILY_RISK = BANKROLL * 0.50
-    MAX_PER_GAME = BANKROLL * 0.10
+    MAX_DAILY_RISK = BANKROLL * DAILY_RISK_PCT
+    MAX_PER_GAME = BANKROLL * GAME_RISK_PCT
     
     with db.get_conn() as conn:
         query = """

@@ -17,6 +17,7 @@ automatically via get_db_client() in db.py.
 """
 
 import os
+import threading
 from contextlib import contextmanager
 from typing import Dict, Optional
 
@@ -27,6 +28,9 @@ import psycopg2.pool
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+
+from src.data.sql_utils import split_schema_sql as _split_schema_sql
 
 
 def _to_py(v):
@@ -56,6 +60,14 @@ def normalize_book(book: Optional[str]) -> str:
     if not book:
         return ''
     return str(book).strip().lower()
+
+
+# DSNs whose schema/migrations already ran in this process. get_db_client() is
+# called by every job, and ALTER TABLE takes an ACCESS EXCLUSIVE lock even when
+# the column exists — re-running it mid-scan queued behind open transactions
+# and froze the scheduler.
+_SCHEMA_READY: set = set()
+_SCHEMA_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +174,13 @@ class PostgresDatabaseClient:
     # ------------------------------------------------------------------
 
     def _init_db(self):
+        with _SCHEMA_LOCK:
+            if self._dsn in _SCHEMA_READY:
+                return
+            self._run_schema()
+            _SCHEMA_READY.add(self._dsn)
+
+    def _run_schema(self):
         schema_path = os.path.join(os.path.dirname(__file__), 'schema_postgres.sql')
         if not os.path.exists(schema_path):
             logger.warning(f"PostgreSQL schema not found at {schema_path}")
@@ -170,19 +189,16 @@ class PostgresDatabaseClient:
         with open(schema_path, 'r') as f:
             schema_sql = f.read()
 
-        # Strip all single-line comments (-- ...) before splitting by semicolon
-        # to avoid splitting on semicolons found inside comments.
-        import re
-        schema_sql = re.sub(r'--.*', '', schema_sql)
-
         # Run in autocommit mode — PostgreSQL DDL is transactional but
         # TimescaleDB create_hypertable requires its own transaction context.
         raw = self._pool.getconn()
         try:
             raw.autocommit = True
             cur = raw.cursor()
-            
-            for stmt in schema_sql.split(';'):
+            # Fail a DDL statement rather than wait forever behind a long transaction.
+            cur.execute("SET lock_timeout = '10s'")
+
+            for stmt in _split_schema_sql(schema_sql):
                 clean_stmt = stmt.strip()
                 if clean_stmt:
                     try:
@@ -209,6 +225,11 @@ class PostgresDatabaseClient:
             _migrations = [
                 "ALTER TABLE games ADD COLUMN IF NOT EXISTS sr_id TEXT",
                 "ALTER TABLE line_history ADD COLUMN IF NOT EXISTS game_id TEXT",
+                "ALTER TABLE clv_tracking ADD COLUMN IF NOT EXISTS close_book TEXT",
+                "ALTER TABLE clv_tracking ADD COLUMN IF NOT EXISTS close_fair_prob REAL",
+                "ALTER TABLE clv_tracking ADD COLUMN IF NOT EXISTS clv_novig REAL",
+                "ALTER TABLE bdl_game_log_cache ADD COLUMN IF NOT EXISTS pf REAL",
+                "ALTER TABLE bdl_game_log_cache ADD COLUMN IF NOT EXISTS season_id TEXT",
             ]
             for _m in _migrations:
                 try:
@@ -239,6 +260,7 @@ class PostgresDatabaseClient:
                 except Exception as _seq_err:
                     logger.debug(f"Sequence reset skipped for {table}.{col}: {_seq_err}")
 
+            cur.execute("RESET lock_timeout")
             logger.info("PostgreSQL schema initialized.")
         finally:
             raw.autocommit = False
@@ -287,12 +309,16 @@ class PostgresDatabaseClient:
                                  max_daily_risk: float = 1000.0,
                                  max_per_game_risk: float = 400.0,
                                  raw_model_prob: float = None,
-                                 model_prob: float = None) -> Optional[int]:
-        """Atomic check-and-insert for PostgreSQL."""
+                                 model_prob: float = None, expires_at=None) -> Optional[int]:
+        """Serialize risk checks across PostgreSQL alert writers."""
         line, edge, odds, stake = _to_py(line), _to_py(edge), _to_py(odds), _to_py(stake)
         raw_model_prob = _to_py(raw_model_prob) if raw_model_prob is not None else None
         model_prob = _to_py(model_prob) if model_prob is not None else None
         with self.get_conn() as conn:
+            # A single INSERT ... SELECT is not sufficient: concurrent
+            # transactions can both read the same remaining risk allowance.
+            # Take a shared transaction lock before acquiring the risk snapshot.
+            conn.execute("SELECT pg_advisory_xact_lock(7261948301)")
             cur = conn.execute(
                 """
                 WITH daily_risk AS (
@@ -311,15 +337,25 @@ class PostgresDatabaseClient:
                 SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 WHERE (SELECT total FROM daily_risk) + %s <= %s
                   AND (SELECT total FROM game_risk) + %s <= %s
+                  AND clock_timestamp() < COALESCE(%s::timestamptz, 'infinity'::timestamptz)
                 RETURNING id
                 """,
                 (event_id, player_name, market, line, side, edge, book, odds, stake,
                  game_date, event_id, home_away, rest_days, raw_model_prob, model_prob,
                  stake, max_daily_risk,
-                 stake, max_per_game_risk)
+                 stake, max_per_game_risk, expires_at)
             )
             row = cur.fetchone()
-            return row['id'] if row else None
+            if not row:
+                return None
+            conn.execute(
+                """
+                INSERT INTO clv_tracking (alert_id, player_id, market, side, alert_odds, alert_time)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                """,
+                (row['id'], player_name, market, side, odds),
+            )
+            return row['id']
 
     def check_recent_alert(self, player_name: str, market: str, line: float,
                            side: str, edge: float) -> bool:
@@ -350,17 +386,22 @@ class PostgresDatabaseClient:
             return [dict(r) for r in cur.fetchall()]
 
     def update_clv_closing_line(self, track_id: int, closing_odds: float,
-                                implied_closing: float, implied_alert: float):
+                                implied_closing: float, implied_alert: float,
+                                close_book: str = None, close_fair_prob: float = None):
         clv = implied_closing - implied_alert
+        # clv_novig > 0: the bet price beat the devigged (fair) close
+        clv_novig = close_fair_prob - implied_alert if close_fair_prob is not None else None
         with self.get_conn() as conn:
             conn.execute(
                 """
                 UPDATE clv_tracking
                 SET closing_odds = %s, implied_closing = %s, implied_alert = %s,
-                    closing_time = NOW(), clv = %s
+                    closing_time = NOW(), clv = %s, close_book = %s,
+                    close_fair_prob = %s, clv_novig = %s
                 WHERE id = %s
                 """,
-                (closing_odds, implied_closing, implied_alert, clv, track_id),
+                (closing_odds, implied_closing, implied_alert, clv, close_book,
+                 close_fair_prob, clv_novig, track_id),
             )
 
     def get_per_market_clv(self, days_back: int = 30, min_samples: int = 10) -> Dict[str, float]:
@@ -1130,6 +1171,32 @@ class PostgresDatabaseClient:
             )
             return cur.fetchone()['id']
 
+    def get_recent_alerts(self, limit: int = 20, hours_back: int = 36) -> list:
+        """
+        Return recent alerts_sent rows (most recent first), LEFT JOINed with
+        their settled result, for the Quant Edge Copilot to narrate over.
+
+        Mirrors DatabaseClient.get_recent_alerts. The time cutoff is computed
+        in Python so the query stays identical across both backends.
+        """
+        from datetime import datetime, timedelta
+        cutoff = (datetime.utcnow() - timedelta(hours=hours_back)).strftime("%Y-%m-%d %H:%M:%S")
+        with self.get_conn() as conn:
+            cur = conn.execute(
+                """
+                SELECT a.id, a.player_name, a.market, a.line, a.side, a.edge,
+                       a.book, a.odds, a.stake, a.raw_model_prob, a.model_prob,
+                       a.timestamp, b.won, b.push, b.actual_result
+                FROM alerts_sent a
+                LEFT JOIN bet_results b ON b.alert_id = a.id
+                WHERE a.timestamp >= %s
+                ORDER BY a.timestamp DESC
+                LIMIT %s
+                """,
+                (cutoff, limit),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
     def get_pending_alerts(self, unsent_only: bool = True) -> list:
         where = "WHERE sent_at IS NULL" if unsent_only else ""
         with self.get_conn() as conn:
@@ -1275,6 +1342,7 @@ class PostgresDatabaseClient:
                              team_abbr, matchup, wl, cached_at)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (player_id, season, game_date) DO UPDATE SET
+                              game_id   = EXCLUDED.game_id,
                             min       = EXCLUDED.min,
                             pts       = EXCLUDED.pts,
                             reb       = EXCLUDED.reb,
@@ -1299,6 +1367,9 @@ class PostgresDatabaseClient:
                          log.get('tov', 0), log.get('team_abbr', ''),
                          log.get('matchup', ''), log.get('wl', ''), now),
                     )
+                    conn.execute('UPDATE bdl_game_log_cache SET pf = ?, season_id = ? '
+                                 'WHERE player_id = ? AND season = ? AND game_date = ?',
+                                 (log.get('pf'), log.get('season_id'), player_id, season, log.get('game_date', '')))
                 except Exception:
                     pass
 

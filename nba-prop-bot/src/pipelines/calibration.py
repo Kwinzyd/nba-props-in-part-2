@@ -7,26 +7,17 @@ def check_calibration():
     
     with db.get_conn() as conn:
         query = """
-        SELECT a.id, a.edge + c.implied_closing as predicted_prob, b.won
-        FROM alerts_sent a
-        JOIN bet_results b ON a.id = b.alert_id
-        LEFT JOIN clv_tracking c ON a.player_name = c.player_id AND a.market = c.market
-        WHERE c.implied_closing IS NOT NULL AND c.implied_closing > 0
-        """
-        # If we don't have clv_tracking, we must approximate predicted prob from alert implied + edge
-        fallback_query = """
-        SELECT a.id, 
-               (1.0 / a.odds) + a.edge as predicted_prob, 
+        SELECT a.id,
+               COALESCE(a.model_prob, (1.0 / a.odds) + a.edge) as predicted_prob,
                b.won
         FROM alerts_sent a
         JOIN bet_results b ON a.id = b.alert_id
+        WHERE b.push = FALSE AND b.won IS NOT NULL AND a.odds > 1.0
         """
-        try:
-            df = pd.read_sql_query(query, conn)
-            if df.empty:
-                df = pd.read_sql_query(fallback_query, conn)
-        except:
-            df = pd.read_sql_query(fallback_query, conn)
+        # One row per alert; closing prices are future information and cannot
+        # reconstruct the probability used when the alert was generated.
+        rows = conn.execute(query).fetchall()
+        df = pd.DataFrame([dict(row) for row in rows])
             
     if df.empty:
         print("Not enough settled data for calibration.")
@@ -34,6 +25,7 @@ def check_calibration():
         
     # Drop NaNs
     df = df.dropna(subset=['predicted_prob', 'won'])
+    df = df[df['predicted_prob'].between(0.0, 1.0)]
     
     if df.empty:
         print("Data exists but lacks probability fields.")

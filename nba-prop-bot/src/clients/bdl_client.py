@@ -59,9 +59,12 @@ class BDLClient:
             wait = max(int(resp.headers.get('Retry-After', 60)), 10)
             logger.warning("BDL rate-limited; sleeping %ss (Retry-After)", wait)
             time.sleep(wait)
-            raise requests.exceptions.RetryError("429 rate limit — retry via backoff")
+            resp = self._session.get(url, params=params, timeout=timeout)
+            if resp.status_code == 429:
+                raise requests.exceptions.RetryError("429 rate limit — retry via backoff")
 
         resp.raise_for_status()
+        time.sleep(0.1)
         return resp.json()
 
     def _get_all_pages(self, url: str, params: dict = None,
@@ -565,6 +568,7 @@ class BDLClient:
                     "book": vendor,
                     "decimal_odds": self.american_to_decimal(over_odds),
                     "american_odds": over_odds,
+                    "updated_at": prop.get('updated_at'),
                     "vendor": vendor,
                 })
             if under_odds is not None:
@@ -576,6 +580,7 @@ class BDLClient:
                     "book": vendor,
                     "decimal_odds": self.american_to_decimal(under_odds),
                     "american_odds": under_odds,
+                    "updated_at": prop.get('updated_at'),
                     "vendor": vendor,
                 })
 

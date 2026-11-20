@@ -278,7 +278,7 @@ def estimate_projected_minutes(recent_logs: pd.DataFrame, season_logs: pd.DataFr
     elif "questionable" in status or "gtd" in status: mult = 0.75
     elif "probable" in status: mult = 0.95
 
-    return max(0.0, base_mins * mult)
+    return min(48.0, max(0.0, base_mins * mult))
 
 
 def calculate_rate(
@@ -348,7 +348,7 @@ def build_player_projection(player_id: str, market: str, line: float,
     and uses this value directly (e.g. from the RotationModel's slot-based projection).
     """
     if projected_minutes_override > 0:
-        proj_mins = projected_minutes_override
+        proj_mins = min(projected_minutes_override, 48.0)
     else:
         proj_mins = estimate_projected_minutes(
             recent_logs, season_logs, injury_status,

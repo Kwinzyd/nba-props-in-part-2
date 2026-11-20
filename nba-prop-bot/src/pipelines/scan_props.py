@@ -35,18 +35,20 @@ from src.data.db import get_db_client
 from src.events.bus import get_bus
 from src.utils.logging_utils import get_logger
 from src.data.db import DatabaseClient
-from src.clients.odds_api import OddsApiClient, OddsApiQuotaError
+from src.clients.odds_api import OddsApiClient, OddsApiQuotaError, OddsApiBudgetError
 from src.clients.sportradar_client import SportradarClient
 from src.clients.nba_stats import NbaStatsClient
 from src.clients.injuries import InjuryClient
 from src.clients.telegram_bot import TelegramBotClient
 from src.config import (
     PROP_MARKETS, ALT_PROP_MARKETS, ALT_TO_BASE_MARKET,
-    EDGE_MIN, REC_BOOKS, SHARP_EDGE_MIN,
+    EDGE_MIN, REC_BOOKS, SHARP_BOOKS, SHARP_EDGE_MIN,
     PLAYOFF_EDGE_MIN, PLAYOFF_SHARP_EDGE_MIN,
     CONSENSUS_BOOKS, CONSENSUS_HOLD_MAX,
     BDL_ENABLED, BDL_PROP_VENDORS,
     ELIMINATION_MODE, ELIMINATION_EDGE_BUMP,
+    MIN_PLAYER_GAMES, BANKROLL, ALERT_LEAD_HOURS, DAILY_RISK_PCT, OVERS_ENABLED, PARLAYS_ENABLED, MODEL_SHADOW_ENABLED,
+    SHARP_FETCH_HOURS, ODDS_FETCH_ALTS, GAME_MARKETS_ENABLED,
 )
 
 # Elimination games: bump every floor; 0.0 keeps regular behaviour.
@@ -71,6 +73,11 @@ from src.models.edge_ranker import (
     set_playoff_mode as set_ranker_playoff_mode,
 )
 from src.models.calibration_model import calibrate_candidates
+from src.pipelines.sharp_picks import record_sharp_pick
+from src.pipelines.candidate_log import record_candidates
+from src.pipelines.shadow_validation import experiments as shadow_experiments, record_predictions
+from src.pipelines.selection_guard import value_rejection, reject
+from src.pipelines.shadow_overs import record_shadow_overs
 from src.models.ml_model import get_ml_projection
 from src.pipelines.send_alerts import evaluate_and_alert, send_game_market_alert, send_line_disagreement_alert
 from src.pipelines.combos import generate_and_alert_combos, generate_slate_ultimate, generate_four_leg_parlays
@@ -110,9 +117,22 @@ _EVENTS_CACHE: Dict[str, Any] = {'data': [], 'fetched_at': None}
 _EVENTS_CACHE_TTL_SEC = 5400  # 90 minutes — matches scan interval
 ODDS_API_DEAD = False  # Track if API is out of credits
 
-# Only fetch sharp Pinnacle odds when the game tips off within this window.
-# Saves 1 Odds API credit per out-of-window game per scan.
-_TIP_OFF_SHARP_HOURS = 4  # was 6 — Pinnacle barely moves 4-6h out
+# Only fetch sharp odds when the game tips off within this window. With
+# ODDS_CACHE_MIN covering the window, that's one fetch per game per day.
+_TIP_OFF_SHARP_HOURS = SHARP_FETCH_HOURS
+
+# Markets per sharp fetch: one Odds API credit each, per game. Game markets
+# only feed game-market alerts; BDL supplies the spread/total the props use.
+_GAME_ODDS_MARKETS = [
+    'h2h', 'spreads', 'totals', 'team_totals',
+    'h2h_q1', 'spreads_q1', 'totals_q1',
+    'h2h_h1', 'spreads_h1', 'totals_h1',
+]
+_SHARP_FETCH_MARKETS = [
+    *PROP_MARKETS,
+    *(ALT_PROP_MARKETS if ODDS_FETCH_ALTS else []),
+    *(_GAME_ODDS_MARKETS if GAME_MARKETS_ENABLED else []),
+]
 
 
 def _get_team_adv_row(df, team_name: str):
@@ -438,10 +458,101 @@ def get_best_odds(bookmakers: List[Dict], player_name: str,
                 side  = outcome.get('name', '').lower()
                 price = outcome.get('price', 0.0)
                 if side == 'over' and price > best_over['price']:
-                    best_over = {"price": price, "book": book['title']}
+                    best_over = {"price": price, "book": book['title'],
+                                 "updated_at": mkt.get('last_update') or book.get('last_update')}
                 elif side == 'under' and price > best_under['price']:
-                    best_under = {"price": price, "book": book['title']}
+                    best_under = {"price": price, "book": book['title'],
+                                  "updated_at": mkt.get('last_update') or book.get('last_update')}
     return best_over, best_under
+
+
+def _make_quote_refresher(event_id, bdl_game_id, bridge, odds_client):
+    """Share an uncached event response for at most 30s across final checks."""
+    cache = {}
+
+    def refresh(candidate):
+        market = candidate['market']
+        key = 'bdl' if bridge and bdl_game_id else market
+        now = datetime.now(timezone.utc)
+        cached = cache.get(key)
+        if cached is None or (now - cached[0]).total_seconds() >= 30:
+            if key == 'bdl':
+                data = bridge.get_props_for_game(bdl_game_id, vendors=BDL_PROP_VENDORS)
+            else:
+                data = odds_client.get_event_odds(event_id, [market], caller='scan', use_cache=False)
+            cache[key] = (now, data)
+        observed, data = cache[key]
+        if key == 'bdl':
+            quote = data.get('quotes', {}).get((candidate['player_id'], market,
+                        candidate['line'], candidate['side'].upper(), candidate['book'].lower()))
+        else:
+            books = [b for b in data.get('bookmakers', [])
+                     if candidate['book'].lower() in ((b.get('title') or '').lower(), (b.get('key') or '').lower())]
+            over, under = get_best_odds(books, candidate['player_id'], market, candidate['line'])
+            quote = over if candidate['side'].upper() == 'OVER' else under
+        return {**quote, 'checked_at': observed.isoformat()} if quote else None
+
+    return refresh
+
+
+def _rec_bookmakers(bookmakers: List[Dict]) -> List[Dict]:
+    """Only the REC_BOOKS entries (Odds API key or title) — the books the user bets."""
+    rec_lower = {b.lower() for b in REC_BOOKS}
+    return [b for b in bookmakers
+            if (b.get('key') or '').lower() in rec_lower or (b.get('title') or '').lower() in rec_lower]
+
+
+def _best_rec_odds(line_records: List[tuple]) -> Dict[tuple, dict]:
+    """
+    Best price per (player, market, line, side) among REC_BOOKS only, from
+    BDL line records (player, market, book, line, side, price, implied).
+    Same shape as the bridge's best_odds, which spans every pulled vendor.
+    """
+    rec_lower = {b.lower() for b in REC_BOOKS}
+    best: Dict[tuple, dict] = {}
+    for name, market, book, line, side, price, _ in line_records:
+        if str(book).lower() not in rec_lower or not price:
+            continue
+        key = (name, market, line, side)
+        if key not in best or price > best[key]["price"]:
+            best[key] = {"price": price, "book": book}
+    return best
+
+
+def _sharp_line_records(sharp_bookmakers: List[Dict]) -> List[tuple]:
+    """line_history rows for the sharp books in an Odds API response (rec books come from BDL)."""
+    sharp_lower = {b.lower() for b in SHARP_BOOKS} | set(CONSENSUS_BOOKS)
+    records = []
+    for book in sharp_bookmakers:
+        key = (book.get('key') or '').lower()
+        if key not in sharp_lower and (book.get('title') or '').lower() not in sharp_lower:
+            continue
+        for mkt in book.get('markets', []):
+            for o in mkt.get('outcomes', []):
+                price, point = float(o.get('price') or 0), o.get('point')
+                if price > 1.0 and point is not None and o.get('description'):
+                    records.append((o['description'], mkt.get('key'), key, float(point),
+                                    str(o.get('name', '')).upper(), price, 1.0 / price))
+    return records
+
+
+# event_id -> fingerprint of the sharp prices last written to line_history,
+# so cached Odds API responses aren't stored again under a new timestamp.
+_SHARP_LH_SEEN: Dict[str, int] = {}
+
+
+def _store_sharp_lines(db, event_id: str, sharp_bookmakers: List[Dict]) -> None:
+    """Persist sharp-book prices (Pinnacle etc.) to line_history so sharp-vs-rec can be backtested."""
+    try:
+        records = _sharp_line_records(sharp_bookmakers)
+        fingerprint = hash(tuple(records))
+        if not records or _SHARP_LH_SEEN.get(event_id) == fingerprint:
+            return
+        db.insert_line_history_batch(records)
+        _SHARP_LH_SEEN[event_id] = fingerprint
+        logger.info(f"Sharp lines: stored {len(records)} price(s) for {event_id}")
+    except Exception as e:
+        logger.warning(f"Sharp lines: line_history write failed for {event_id}: {e}")
 
 
 def _american(decimal_odds: float) -> str:
@@ -538,8 +649,8 @@ def _get_best_bdl_odds(
 # ─── Sharp line disagreement detection ────────────────────────────────
 
 _SHARP_LINE_BOOKS = {'pinnacle', 'circa', 'bookmaker'}
-_SOFT_LINE_BOOKS  = {'draftkings', 'fanduel', 'betmgm', 'caesars',
-                     'pointsbet', 'betrivers', 'unibet'}
+# Only books the user can bet (REC_BOOKS = DraftKings/FanDuel).
+_SOFT_LINE_BOOKS  = {b.lower() for b in REC_BOOKS}
 _MIN_LINE_GAP     = 1.0   # full integer (e.g. 9.5 vs 10.5)
 
 
@@ -585,14 +696,19 @@ def detect_line_disagreements(
     db, bot,
 ):
     """
-    Scan for cases where a sharp book's line differs from a soft book's by
-    >= 1 full point.  Fire a priority alert for each disagreement.
+    Scan for cases where a sharp book's line differs from a DraftKings/FanDuel
+    line by >= 1 full point, and send at most one alert per player per day.
 
     Example: Pinnacle has Rebounds @ 9.5, DraftKings has Rebounds @ 10.5
-             → alert UNDER 10.5 on DraftKings.
+             -> alert UNDER 10.5 on DraftKings.
+
+    When a player has several disagreements (both books, several markets),
+    the one with the biggest line gap is sent, ties broken by the better
+    price. A disagreement is only sent when the soft book actually prices
+    that side of that line.
     """
     book_lines = _build_book_line_map(line_records, sharp_bookmakers)
-    alerted: set = set()
+    best_by_player: Dict[str, Dict[str, Any]] = {}
 
     for (player, market), books in book_lines.items():
         sharp_books = {b: lines for b, lines in books.items() if b in _SHARP_LINE_BOOKS}
@@ -601,11 +717,7 @@ def detect_line_disagreements(
         if not sharp_books or not soft_books:
             continue
 
-        # Reference sharp line: use Pinnacle if available.
-        # Take the line closest to the center of the market (most books
-        # will converge here) — i.e. pick the line that also appears in
-        # the most soft books.  If ambiguous, take the lowest (sharp
-        # books move down first when adjusting).
+        # Reference sharp line: Pinnacle if available.
         if 'pinnacle' in sharp_books:
             ref_sharp_book = 'pinnacle'
             ref_sharp_lines = sharp_books['pinnacle']
@@ -613,9 +725,8 @@ def detect_line_disagreements(
             ref_sharp_book = next(iter(sharp_books))
             ref_sharp_lines = sharp_books[ref_sharp_book]
 
-        # If Pinnacle offers multiple lines (main + alts), use the one
-        # that most soft books also offer — that's the "main" line.
-        # Fallback: the minimum (sharps tend to shade low).
+        # If the sharp book offers several lines (main + alts), use one the
+        # soft books also offer — that's the main line. Fallback: the minimum.
         all_soft_lines = set()
         for sl in soft_books.values():
             all_soft_lines.update(sl)
@@ -626,39 +737,43 @@ def detect_line_disagreements(
         for soft_book, soft_line_set in soft_books.items():
             for soft_line in soft_line_set:
                 gap = soft_line - ref_sharp_line
-
                 if abs(gap) < _MIN_LINE_GAP:
                     continue
 
-                # If soft_line > sharp_line → UNDER on soft book
-                # If soft_line < sharp_line → OVER on soft book
+                # soft line above sharp -> UNDER on soft book, below -> OVER
                 side = "UNDER" if gap > 0 else "OVER"
 
-                dedup_key = (player, market, soft_book, side)
-                if dedup_key in alerted:
-                    continue
-                alerted.add(dedup_key)
-
-                # Look up the best price on the soft book for this line+side
-                soft_odds = 1.91  # default -110 if we can't find exact price
+                soft_odds = None
                 for rec in line_records:
                     r_player, r_mkt, r_book, r_line, r_side, r_price, _ = rec
                     if (r_player == player and r_mkt == market
                             and r_book.lower() == soft_book
                             and abs(r_line - soft_line) < 0.01
                             and r_side.upper() == side
-                            and r_price > soft_odds):
+                            and r_price > 1.0
+                            and (soft_odds is None or r_price > soft_odds)):
                         soft_odds = r_price
+                if soft_odds is None:
+                    continue
 
-                send_line_disagreement_alert(
+                cand = dict(
                     player=player, market=market,
                     sharp_book=ref_sharp_book.title(), sharp_line=ref_sharp_line,
                     soft_book=soft_book.title(), soft_line=soft_line,
                     side=side, soft_odds=soft_odds,
-                    game_date=game_date, event_id=event_id,
-                    home_team=home_team, away_team=away_team,
-                    db=db, _bot=bot,
                 )
+                prev = best_by_player.get(player)
+                if prev is None or (abs(gap), soft_odds) > (
+                        abs(prev['soft_line'] - prev['sharp_line']), prev['soft_odds']):
+                    best_by_player[player] = cand
+
+    for cand in best_by_player.values():
+        send_line_disagreement_alert(
+            **cand,
+            game_date=game_date, event_id=event_id,
+            home_team=home_team, away_team=away_team,
+            db=db, _bot=bot,
+        )
 
 
 def _sync_injuries_bdl(db: DatabaseClient, game_date: str):
@@ -772,7 +887,9 @@ def scan_props():
             if dateutil.parser.isoparse(e['commence_time'])
                .astimezone(local_zone).strftime('%Y-%m-%d') == today
         ]
-        for e in events:
+        # Today's events only — the feed also lists future games (e.g. Christmas),
+        # which would otherwise overwrite today's event for the same team.
+        for e in odds_events:
             odds_map[e['home_team'].lower()] = e['id']
             odds_map[e['away_team'].lower()] = e['id']
     except (Exception, OddsApiQuotaError) as e:
@@ -807,8 +924,27 @@ def scan_props():
     _all_ref_assignments = fetch_today_assignments()
 
     candidates = []
+    quote_refreshers = {}
+    try:
+        _shadow_selected = shadow_experiments(db) if MODEL_SHADOW_ENABLED else []
+    except Exception as exc:
+        logger.warning('Prospective validation unavailable: %s', exc)
+        _shadow_selected = []
+
+    # Alerts go out as each game finishes scanning so early tip-offs aren't
+    # held behind the whole slate. Each game yet to tip gets a fair share of
+    # the daily budget here; the end-of-scan pass hands leftover budget to the
+    # best remaining edges, minus the shares reserved for games that haven't
+    # entered their ALERT_LEAD_HOURS window yet (so a 7pm slate can't spend
+    # the 10pm games' budget).
+    _daily_budget = BANKROLL * DAILY_RISK_PCT
+    _hours_left = [_hours_until(e.get('commence_time', '')) for e in today_events]
+    _hours_left = [h for h in _hours_left if h is None or h > 0]
+    _game_risk_share = _daily_budget / max(len(_hours_left), 1)
+    _reserved = _game_risk_share * sum(1 for h in _hours_left if h is not None and h > ALERT_LEAD_HOURS)
 
     for event in today_events:
+        _game_cand_start = len(candidates)
         # ── Resolve game identifiers ──────────────────────────────────
         if BDL_ENABLED_RUNTIME:
             bdl_game_id = event.get("bdl_game_id")
@@ -837,6 +973,9 @@ def scan_props():
                 pass
 
         game_date = today
+        quote_refreshers[event_id] = _make_quote_refresher(
+            event_id, bdl_game_id if BDL_ENABLED_RUNTIME else None,
+            _bdl_bridge if BDL_ENABLED_RUNTIME else None, odds_client)
 
         # ── 3. Fetch prop lines ───────────────────────────────────────
         if BDL_ENABLED_RUNTIME and bdl_game_id:
@@ -844,7 +983,7 @@ def scan_props():
             bdl_data = _bdl_bridge.get_props_for_game(bdl_game_id, vendors=BDL_PROP_VENDORS)
             players_in_event = bdl_data["players_in_event"]
             prices_by_market = bdl_data["prices_by_market"]
-            bdl_best_odds    = bdl_data["best_odds"]
+            bdl_best_odds    = _best_rec_odds(bdl_data["line_records"])
             bdl_player_map   = bdl_data["player_id_map"]
 
             if bdl_player_map:
@@ -870,17 +1009,16 @@ def scan_props():
                 try:
                     sharp_odds = odds_client.get_event_odds(
                         event_id=event_id,
-                        markets=[
-                            *PROP_MARKETS, *ALT_PROP_MARKETS,
-                            'h2h', 'spreads', 'totals', 'team_totals',
-                            'h2h_q1', 'spreads_q1', 'totals_q1',
-                            'h2h_h1', 'spreads_h1', 'totals_h1',
-                        ]
+                        markets=_SHARP_FETCH_MARKETS,
+                        caller='scan',
                     )
                     sharp_bookmakers = sharp_odds.get('bookmakers', [])
-                except OddsApiQuotaError:
-                    ODDS_API_DEAD = True
-                    logger.warning(f"Odds API quota exceeded — falling back to Sportradar for {event_id}")
+                    _store_sharp_lines(db, event_id, sharp_bookmakers)
+                except OddsApiQuotaError as _qe:
+                    # A refused budget request costs nothing; later games may still fit.
+                    if not isinstance(_qe, OddsApiBudgetError):
+                        ODDS_API_DEAD = True
+                    logger.warning(f"Odds API unavailable ({_qe}) — falling back to Sportradar for {event_id}")
                     sharp_bookmakers = []
                     
                     if bdl_game_id:
@@ -923,12 +1061,8 @@ def scan_props():
                     raise OddsApiQuotaError("Odds API is already dead")
                 odds_data = odds_client.get_event_odds(
                     event_id=event_id,
-                    markets=[
-                        *PROP_MARKETS, *ALT_PROP_MARKETS,
-                        'h2h', 'spreads', 'totals', 'team_totals',
-                        'h2h_q1', 'spreads_q1', 'totals_q1',
-                        'h2h_h1', 'spreads_h1', 'totals_h1',
-                    ]
+                    markets=_SHARP_FETCH_MARKETS,
+                    caller='scan',
                 )
             except OddsApiQuotaError:
                 ODDS_API_DEAD = True
@@ -1634,11 +1768,10 @@ def scan_props():
                 # Fallback to nba_api
                 if cache_key not in _PROJECTIONS_CACHE:
                     try:
-                        from nba_api.stats.static import players as nba_players
-                        found = nba_players.find_players_by_full_name(player_name)
-                        if not found:
+                        player_id = NbaStatsClient.resolve_player_id(player_name)
+                        if not player_id:
+                            logger.debug(f"Could not resolve NBA player ID for {player_name!r}")
                             continue
-                        player_id = found[0]['id']
                         logs = stats_client.get_player_game_logs(player_id)
                         time.sleep(0.6)
                         _PROJECTIONS_CACHE[cache_key] = {"logs": logs, "pid": player_id}
@@ -1647,7 +1780,14 @@ def scan_props():
 
             p_data        = _PROJECTIONS_CACHE[cache_key]
             logs          = p_data["logs"]
-            player_id_int = p_data.get("pid")
+            # On/off, initiator and Redis features use NBA player IDs, even
+            # when the underlying box-score logs came from BDL.
+            player_id_int = (NbaStatsClient.resolve_player_id(player_name)
+                             if logs.attrs.get('game_id_provider') == 'bdl' else p_data.get('pid'))
+
+            if len(logs) < MIN_PLAYER_GAMES:
+                logger.debug(f"{player_name}: only {len(logs)} game log(s) — too thin to project, skipping")
+                continue
 
             # Home/away + rest days
             player_team_abbr = logs.iloc[0]['TEAM_ABBREVIATION'] if not logs.empty else None
@@ -1708,8 +1848,8 @@ def scan_props():
                         absent_player_ids=absent_ids,
                         logs=logs, season=stats_client.season, db=db,
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug('Rotation fallback for %s: %s', player_name, type(exc).__name__)
 
             _position_group = NbaStatsClient.infer_position_group(logs)
 
@@ -1895,6 +2035,10 @@ def scan_props():
                                 logger.debug(f"Redis live_usage lookup failed for {player_name}: {e}")
 
                     _opp_abbr_ml = TEAM_NAME_TO_ABBR.get(opp_team, opp_team.split()[-1][:3].upper())
+                    _shadow_features = {}
+                    _shadow_baseline_mean = proj['mean']
+                    _shadow_ml_minutes = proj['projected_minutes']
+                    _bayes_w = 0.60 if PLAYOFF_MODE else 0.50
                     ml_mean = get_ml_projection(
                         base_mkt, logs, proj['projected_minutes'], home_flag, rest_days,
                             playoff_flag=PLAYOFF_MODE,
@@ -1922,7 +2066,7 @@ def scan_props():
                         avg_deflections=_bdl_profile.get('avg_deflections', 0.0),
                         avg_points_paint=_bdl_profile.get('avg_points_paint', 0.0),
                         avg_pct_pts_paint=_bdl_profile.get('avg_pct_pts_paint', 0.0),
-                        player_foul_rate=_player_foul_rate,
+                        player_foul_rate=_player_foul_rate, feature_sink=_shadow_features,
                     )
                     if ml_mean is not None and ml_mean > 0:
                         # In playoffs, lean on the Bayesian projection (recency-
@@ -1933,6 +2077,8 @@ def scan_props():
                         proj['ml_blend'] = True
 
                     # BDL playtype × opponent boost
+                    _shadow_actual_pre = proj['mean']
+
                     if _bdl_booster and player_name in bdl_player_map:
                         _bdl_mult = get_bdl_boost(
                             _bdl_booster,
@@ -1964,6 +2110,7 @@ def scan_props():
                     # Standings minutes adjustment
                     if _standings_min_adj != 1.0:
                         proj['projected_minutes'] *= _standings_min_adj
+                        proj['mean'] *= _standings_min_adj
 
                     # Tight whistle
                     if _crew_factor["tight_whistle"] and base_mkt in {
@@ -2019,6 +2166,9 @@ def scan_props():
                     # ── PRA Arbitrage Consistency Check ───────────────────
                     # Enforce that PRA rigidly equals E[P] + E[R] + E[A].
                     # Because PROP_MARKETS evaluates P, R, A before PRA, they are cached here.
+                    if proj['projected_minutes'] > 48:
+                        proj['mean'] *= 48 / proj['projected_minutes']
+                        proj['projected_minutes'] = 48.0
                     if base_mkt in ['player_points', 'player_rebounds', 'player_assists']:
                         pra_components[base_mkt] = proj['mean']
                     elif base_mkt == 'player_points_rebounds_assists':
@@ -2034,8 +2184,7 @@ def scan_props():
 
                     _bench_tier = classify_bench_tier(proj['projected_minutes'])
                     
-                    dists = get_probability_distribution(
-                        base_mkt, proj['mean'], line, logs=logs,
+                    _shadow_distribution = dict(
                         variance_scale=proj.get('variance_scale', 1.0),
                         proj_minutes=proj['projected_minutes'],
                         spread=_home_spread or 0.0,
@@ -2050,23 +2199,18 @@ def scan_props():
                         closeout_game=bool(proj.get('closeout_opportunity', False)),
                     )
 
-                    # ── Get best odds (BDL primary, Odds API for sharp) ───
+                    # ── Get best odds at the books the user can bet ───────
+                    # Sharp books are the fair-price reference only, never
+                    # the price an alert is graded at.
+                    dists = get_probability_distribution(base_mkt, proj['mean'], line, logs=logs, **_shadow_distribution)
+
                     if BDL_ENABLED_RUNTIME:
                         best_over, best_under = _get_best_bdl_odds(
                             bdl_best_odds, player_name, mkt, line
                         )
-                        # Also check sharp bookmakers for better price
-                        if sharp_bookmakers:
-                            s_over, s_under = get_best_odds(
-                                sharp_bookmakers, player_name, mkt, line
-                            )
-                            if s_over['price'] > best_over.get('price', 0):
-                                best_over = s_over
-                            if s_under['price'] > best_under.get('price', 0):
-                                best_under = s_under
                     else:
                         best_over, best_under = get_best_odds(
-                            sharp_bookmakers, player_name, mkt, line
+                            _rec_bookmakers(sharp_bookmakers), player_name, mkt, line
                         )
 
                     # Devig
@@ -2094,12 +2238,23 @@ def scan_props():
                         **proj,
                         "home_team": home_team, "away_team": away_team,
                         "game_date": game_date, "event_id": event_id,
+                        "commence_time": commence_str,
                         "home_away": "HOME" if home_flag else "AWAY",
                         "rest_days": rest_days,
                         "team_name": home_team if home_flag else away_team,
                         "consensus_prob": _consensus_o,
                         "consensus_label": _consensus_label,
                         "hours_to_tipoff": _hours_to_tip,
+                        "prob_push": dists.get('prob_push', 0.0),
+                        "bdl_game_id": bdl_game_id,
+                        "bdl_player_id": bdl_player_map.get(player_name),
+                        "_shadow_inputs": {
+                            'features': _shadow_features, 'baseline_mean': float(_shadow_baseline_mean),
+                            'ml_minutes': float(_shadow_ml_minutes), 'ml_weight': 1 - _bayes_w,
+                            'actual_pre_post_mean': float(_shadow_actual_pre),
+                            'distribution': _shadow_distribution, 'playoff_mode': PLAYOFF_MODE,
+                            'logs': logs.head(20)[[c for c in ('PTS', 'REB', 'AST', 'MIN', 'PF') if c in logs]].copy(),
+                        },
                         "sharp_line_shift": _sharp_shift,
                     }
 
@@ -2168,6 +2323,19 @@ def scan_props():
                             if dedup_key in sharp_alerted:
                                 continue
                             sharp_alerted.add(dedup_key)
+                            try:
+                                _new_sharp = record_sharp_pick(
+                                    db, game_date=game_date, event_id=event_id,
+                                    player_name=player_name, market=base_mkt, line=line,
+                                    side=chk_side, book=rec_book, odds=rec_price,
+                                    fair_prob=true_prob, consensus_label=_consensus_label,
+                                    hours_to_tipoff=_hours_to_tip,
+                                )
+                            except Exception as e:
+                                logger.warning(f"Sharp pick: recording failed: {e}")
+                                _new_sharp = True
+                            if not _new_sharp:
+                                continue  # already alerted on an earlier scan
                             msg = (
                                 f"🔪 <b>Sharp Alert: {player_name} "
                                 f"{chk_side} {line} {mkt_label}</b>\n\n"
@@ -2178,48 +2346,106 @@ def scan_props():
                             )
                             bot.send_message(msg)
 
-        # ── Build Full Team Correlation Matrix for SGPs ───────────────
-        for _t_name, _t_logs in team_player_logs.items():
-            try:
-                from src.models.sgp_correlations import build_full_team_correlation_matrix
-                build_full_team_correlation_matrix(_t_name, _t_logs, db)
-            except Exception as e:
-                logger.warning(f"Failed to build full team correlation matrix for {_t_name}: {e}")
+        # ── SGP correlation matrices (only parlays read them) ─────────
+        if PARLAYS_ENABLED:
+            for _t_name, _t_logs in team_player_logs.items():
+                try:
+                    from src.models.sgp_correlations import build_full_team_correlation_matrix
+                    build_full_team_correlation_matrix(_t_name, _t_logs, db)
+                except Exception as e:
+                    logger.warning(f"Failed to build full team correlation matrix for {_t_name}: {e}")
 
-        # ── Cross-Team Correlations (big-vs-big, empirical in playoffs) ──
-        try:
-            from src.models.sgp_correlations import build_cross_team_correlation_matrix
-            _away_abbr_corr = TEAM_NAME_TO_ABBR.get(away_team, '')
-            build_cross_team_correlation_matrix(
-                home_team, away_team, stats_client, db,
-                home_player_logs=team_player_logs.get(home_team),
-                away_player_logs=team_player_logs.get(away_team),
-                away_abbr=_away_abbr_corr,
-                playoff_mode=PLAYOFF_MODE,
-            )
-        except Exception as e:
-            logger.warning(f"Failed to build cross-team correlation matrix for {home_team} vs {away_team}: {e}")
+            # Cross-team correlations (big-vs-big, empirical in playoffs)
+            try:
+                from src.models.sgp_correlations import build_cross_team_correlation_matrix
+                _away_abbr_corr = TEAM_NAME_TO_ABBR.get(away_team, '')
+                build_cross_team_correlation_matrix(
+                    home_team, away_team, stats_client, db,
+                    home_player_logs=team_player_logs.get(home_team),
+                    away_player_logs=team_player_logs.get(away_team),
+                    away_abbr=_away_abbr_corr,
+                    playoff_mode=PLAYOFF_MODE,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to build cross-team correlation matrix for {home_team} vs {away_team}: {e}")
+
+        # ── Per-game alerts ───────────────────────────────────────────
+        _game_cands = calibrate_candidates(candidates[_game_cand_start:], playoff_mode=PLAYOFF_MODE)
+        if _shadow_selected:
+            try:
+                record_predictions(_game_cands, db, quote_refreshers[event_id], selected=_shadow_selected)
+            except Exception as exc:
+                logger.warning('Prospective shadow recording failed: %s', exc)
+        _game_actionable = _actionable_edges(_game_cands)
+        if _game_actionable:
+            logger.info(f"{away_team} @ {home_team}: {len(_game_actionable)} actionable edge(s) — alerting now")
+        for edge in _game_actionable:
+            evaluate_and_alert(edge, db, bot, game_risk_cap=_game_risk_share,
+                               refresh_quote=quote_refreshers.get(edge.get('event_id')))
 
     # ── Rank and alert ────────────────────────────────────────────────
-    candidates = calibrate_candidates(candidates, playoff_mode=PLAYOFF_MODE)
-    ranked_edges = rank_edges(candidates)
-    _edge_min_floor = (PLAYOFF_EDGE_MIN if PLAYOFF_MODE else EDGE_MIN) + _ELIM_BUMP
-    actionable = [e for e in ranked_edges if e.get('edge', 0) >= e.get('edge_min_applied', _edge_min_floor)]
+    # Games that exited the loop early were never calibrated above.
+    calibrate_candidates([c for c in candidates if not c.get('calibrated')], playoff_mode=PLAYOFF_MODE)
+    actionable = _actionable_edges(candidates)
+    for candidate in candidates:
+        reason = value_rejection(candidate)
+        if reason:
+            reject(candidate, db, reason)
+    try:
+        record_shadow_overs(candidates, db)
+    except Exception as e:
+        logger.warning(f"Shadow overs: recording failed: {e}")
+    try:
+        record_candidates(candidates, db)
+    except Exception as e:
+        logger.warning(f"Candidate log: recording failed: {e}")
 
     logger.info(
         f"Scan complete: {len(candidates)} candidates, {len(actionable)} actionable edges. "
         f"{'[BDL+Sharp mode]' if BDL_ENABLED_RUNTIME else '[Odds API mode]'}"
     )
 
+    # Already-sent alerts are skipped as duplicates; this spends leftover budget.
     for edge in actionable:
-        evaluate_and_alert(edge, db, bot)
+        evaluate_and_alert(edge, db, bot, daily_risk_cap=_daily_budget - _reserved,
+                           refresh_quote=quote_refreshers.get(edge.get('event_id')))
 
-    generate_and_alert_combos(actionable, bot, db=db, playoff_mode=PLAYOFF_MODE)
-    generate_four_leg_parlays(actionable, bot, db=db, playoff_mode=PLAYOFF_MODE)
-    generate_slate_ultimate(actionable, bot, db=db, playoff_mode=PLAYOFF_MODE)
+    if PARLAYS_ENABLED:
+        generate_and_alert_combos(actionable, bot, db=db, playoff_mode=PLAYOFF_MODE)
+        generate_four_leg_parlays(actionable, bot, db=db, playoff_mode=PLAYOFF_MODE)
+        generate_slate_ultimate(actionable, bot, db=db, playoff_mode=PLAYOFF_MODE)
 
     if BDL_ENABLED_RUNTIME and _bdl_bridge:
         logger.info(f"BDL requests this scan: {_bdl_bridge.bdl.requests_made}")
+
+
+def _hours_until(commence_str: str) -> Optional[float]:
+    """Hours from now until an ISO tip-off time (negative once tipped); None if unparseable."""
+    if not commence_str:
+        return None
+    try:
+        dt = dateutil.parser.isoparse(commence_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (dt - datetime.now(timezone.utc)).total_seconds() / 3600.0
+    except Exception:
+        return None
+
+
+def _actionable_edges(cands: list) -> list:
+    """
+    Rank candidates (idempotent) and keep those clearing their edge floor
+    whose game tips within ALERT_LEAD_HOURS (later scans pick up the rest).
+    Overs are dropped unless OVERS_ENABLED.
+    """
+    _edge_min_floor = (PLAYOFF_EDGE_MIN if PLAYOFF_MODE else EDGE_MIN) + _ELIM_BUMP
+    valid = [c for c in cands if value_rejection(c) is None]
+    return [
+        e for e in rank_edges(valid)
+        if e.get('edge', 0) >= e.get('edge_min_applied', _edge_min_floor)
+        and e.get('hours_to_tipoff', 0.0) <= ALERT_LEAD_HOURS
+        and (OVERS_ENABLED or str(e.get('side', '')).upper() != 'OVER')
+    ]
 
 
 if __name__ == "__main__":

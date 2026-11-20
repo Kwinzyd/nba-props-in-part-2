@@ -16,6 +16,7 @@ import random
 from datetime import datetime
 from typing import List, Dict, Set, Optional
 from src.utils.logging_utils import get_logger
+from src.clients.news_monitor import mentions, find_players
 
 logger = get_logger(__name__)
 
@@ -83,7 +84,11 @@ class TwitterNitterMonitor:
     def _load_player_names() -> Set[str]:
         try:
             from nba_api.stats.static import players
-            return {p['full_name'].lower() for p in players.get_players()}
+            from src.clients.nba_stats import get_current_roster
+            names = {p['full_name'].lower() for p in players.get_players()}
+            # Rookies / new signings aren't in the bundled static list
+            names |= {n.lower() for n in get_current_roster()['id_to_name'].values()}
+            return names
         except Exception:
             return set()
 
@@ -151,11 +156,10 @@ class TwitterNitterMonitor:
     @staticmethod
     def _is_injury_related(text: str) -> bool:
         text_lower = text.lower()
-        return any(kw in text_lower for kw in INJURY_KEYWORDS)
+        return any(mentions(text_lower, kw) for kw in INJURY_KEYWORDS)
 
     def _extract_players(self, text: str) -> List[str]:
-        text_lower = text.lower()
-        return [name for name in self._player_names if name in text_lower]
+        return find_players(text.lower(), self._player_names)
 
     def _process_entry(
         self,
@@ -178,6 +182,8 @@ class TwitterNitterMonitor:
             return None
 
         players_found = self._extract_players(combined)
+        if not players_found:
+            return None     # injury words but no NBA player named
         return {
             'player_name':  players_found[0].title() if players_found else '',
             'all_players':  [p.title() for p in players_found],

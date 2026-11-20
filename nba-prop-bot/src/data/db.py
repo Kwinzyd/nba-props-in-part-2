@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import pandas as pd
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from typing import Dict, Optional
 from src.config import DB_PATH
@@ -167,6 +168,11 @@ class DatabaseClient:
         (21, "clv_tracking: alert_id", "ALTER TABLE clv_tracking ADD COLUMN alert_id INTEGER REFERENCES alerts_sent(id)"),
         (22, "alerts_sent: raw_model_prob", "ALTER TABLE alerts_sent ADD COLUMN raw_model_prob REAL"),
         (23, "alerts_sent: model_prob",     "ALTER TABLE alerts_sent ADD COLUMN model_prob REAL"),
+        (24, "clv_tracking: close_book",    "ALTER TABLE clv_tracking ADD COLUMN close_book TEXT"),
+        (25, "clv_tracking: close_fair_prob", "ALTER TABLE clv_tracking ADD COLUMN close_fair_prob REAL"),
+        (26, "clv_tracking: clv_novig",     "ALTER TABLE clv_tracking ADD COLUMN clv_novig REAL"),
+        (27, "bdl cache: personal fouls", "ALTER TABLE bdl_game_log_cache ADD COLUMN pf REAL"),
+        (28, "bdl cache: season type", "ALTER TABLE bdl_game_log_cache ADD COLUMN season_id TEXT"),
     ]
 
     def _migrate_schema(self, conn):
@@ -240,7 +246,8 @@ class DatabaseClient:
                                  edge: float, book: str, odds: float, stake: float,
                                  game_date: str, event_id: str, home_away: str, rest_days: int,
                                  max_daily_risk: float, max_per_game_risk: float,
-                                 raw_model_prob: float = None, model_prob: float = None) -> Optional[int]:
+                                 raw_model_prob: float = None, model_prob: float = None,
+                                 expires_at=None) -> Optional[int]:
         """
         Atomic check-and-insert: only inserts if the new stake won't exceed
         daily or per-game risk limits. Returns the new alert_id or None.
@@ -268,6 +275,8 @@ class DatabaseClient:
                     return None
 
             # 3. All OK -> Insert
+            if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
+                return None
             cursor.execute(
                 """
                 INSERT INTO alerts_sent
@@ -300,7 +309,7 @@ class DatabaseClient:
                 SELECT edge FROM alerts_sent
                 WHERE player_name = ? AND market = ? AND side = ?
                 AND abs(line - ?) <= 0.5
-                AND timestamp >= NOW() - INTERVAL '12 hours'
+                AND timestamp >= datetime('now', '-12 hours')
                 ORDER BY timestamp DESC LIMIT 1
                 """,
                 (player_name, market, side, line)
@@ -317,18 +326,22 @@ class DatabaseClient:
             cursor.execute("SELECT * FROM clv_tracking WHERE closing_odds IS NULL")
             return [dict(r) for r in cursor.fetchall()]
 
-    def update_clv_closing_line(self, track_id: int, closing_odds: float, implied_closing: float, implied_alert: float):
+    def update_clv_closing_line(self, track_id: int, closing_odds: float, implied_closing: float, implied_alert: float,
+                                close_book: str = None, close_fair_prob: float = None):
         clv = implied_closing - implied_alert
+        clv_novig = close_fair_prob - implied_alert if close_fair_prob is not None else None
         with self.get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
                 UPDATE clv_tracking
                 SET closing_odds = ?, implied_closing = ?, implied_alert = ?,
-                    closing_time = CURRENT_TIMESTAMP, clv = ?
+                    closing_time = CURRENT_TIMESTAMP, clv = ?, close_book = ?,
+                    close_fair_prob = ?, clv_novig = ?
                 WHERE id = ?
                 """,
-                (closing_odds, implied_closing, implied_alert, clv, track_id)
+                (closing_odds, implied_closing, implied_alert, clv, close_book,
+                 close_fair_prob, clv_novig, track_id)
             )
 
     def insert_line_history(self, player_name: str, market: str, bookmaker: str,
@@ -1263,6 +1276,35 @@ class DatabaseClient:
             )
             return cursor.lastrowid
 
+    def get_recent_alerts(self, limit: int = 20, hours_back: int = 36) -> list:
+        """
+        Return recent alerts_sent rows (most recent first), LEFT JOINed with
+        their settled result, for the Quant Edge Copilot to narrate over.
+
+        The time cutoff is computed in Python (not via NOW()/datetime() SQL
+        functions) so the query is portable across the SQLite and Postgres
+        backends. Returns a list of dicts with the structured fields the
+        copilot is allowed to cite — never any value it must compute itself.
+        """
+        from datetime import datetime, timedelta
+        cutoff = (datetime.utcnow() - timedelta(hours=hours_back)).strftime("%Y-%m-%d %H:%M:%S")
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT a.id, a.player_name, a.market, a.line, a.side, a.edge,
+                       a.book, a.odds, a.stake, a.raw_model_prob, a.model_prob,
+                       a.timestamp, b.won, b.push, b.actual_result
+                FROM alerts_sent a
+                LEFT JOIN bet_results b ON b.alert_id = a.id
+                WHERE a.timestamp >= ?
+                ORDER BY a.timestamp DESC
+                LIMIT ?
+                """,
+                (cutoff, limit),
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
     def get_pending_alerts(self, unsent_only: bool = True) -> list:
         """
         Return pending_alerts rows as dicts.
@@ -1451,6 +1493,9 @@ class DatabaseClient:
                          log.get('tov', 0), log.get('team_abbr', ''),
                          log.get('matchup', ''), log.get('wl', ''), now)
                     )
+                    conn.execute('UPDATE bdl_game_log_cache SET pf = ?, season_id = ? '
+                                 'WHERE player_id = ? AND season = ? AND game_date = ?',
+                                 (log.get('pf'), log.get('season_id'), player_id, season, log.get('game_date', '')))
                 except Exception:
                     pass
     def get_cached_bdl_game_logs(self, player_id: int, season: int, ignore_ttl: bool = False) -> list:

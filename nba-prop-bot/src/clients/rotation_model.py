@@ -68,15 +68,13 @@ class RotationModel:
             target_player_id=203076,
             absent_player_ids=[203507],
             logs=target_player_logs_df,
-            season="2024-25",
+            season="2026-27",
             db=db_client,
         )
     """
 
-    # Playoff Adjustments: Reduced GAMES_BACK from 15 to 5 to drop noisy regular
-    # season games. Reduced MIN_GAMES to 3 to activate the model earlier in a series.
-    GAMES_BACK      = 5
-    MIN_GAMES       = 3
+    GAMES_BACK      = 15
+    MIN_GAMES       = 5   # need at least 5 PBP games to trust the model
     NEXT_MAN_THRESHOLD = 0.40  # slot_prob >= 40% = "this is their typical slot"
 
     def __init__(self, nba_client):
@@ -97,6 +95,12 @@ class RotationModel:
         are OUT. Returns 0.0 if insufficient PBP data (caller should fall back).
         """
         if not absent_player_ids or logs.empty:
+            return 0.0
+        if logs.attrs.get('game_id_provider') == 'bdl':
+            logger.debug('Rotation fallback: BDL IDs require mapping to NBA PBP IDs')
+            return 0.0
+        if 'GAME_ID' not in logs:
+            logger.debug('Rotation fallback: no NBA game IDs')
             return 0.0
 
         team_abbr  = str(logs.iloc[0].get('TEAM_ABBREVIATION', ''))
@@ -119,31 +123,46 @@ class RotationModel:
         absent_ids: List[int],
         team_slots: Dict[int, Dict[str, float]],
     ) -> float:
-        absent_set    = set(absent_ids)
-        target_slots  = team_slots.get(target_id, {})
-
-        if not target_slots:
-            return 0.0
-
-        # Base minutes from own typical rotation slots
-        base_mins = sum(target_slots.values()) * SLOT_DURATION_MIN
-
-        # Absorbed minutes from each absent player's vacated slots
-        bonus_mins = 0.0
-        for absent_id in absent_ids:
-            absent_slots = team_slots.get(absent_id, {})
-            for slot_key, absent_prob in absent_slots.items():
-                if absent_prob < self.NEXT_MAN_THRESHOLD:
-                    continue
-                if not self._is_next_man_up(target_id, slot_key, team_slots, absent_set):
-                    continue
-                own_prob    = target_slots.get(slot_key, 0.0)
-                # Credit the delta so we don't double-count slots the target
-                # already plays even when the absent player is healthy.
-                bonus_mins += max(0.0, absent_prob - own_prob) * SLOT_DURATION_MIN
-
-        total = base_mins + bonus_mins
+        total = self._allocate_minutes(absent_ids, team_slots).get(target_id, 0.0)
         return total if total > 1.0 else 0.0   # ignore noise < 1 minute
+
+    def _allocate_minutes(self, absent_ids, team_slots):
+        """Joint fractional allocation: <=1 court place/player, <=5 per slot.
+
+        Historical presence weights resolve replacements, not a single winner
+        among starters already on court. Vacancies from all absences are pooled.
+        Insufficient eligible rotation depth leaves unallocated minutes.
+        """
+        import math
+        absent = set(absent_ids)
+        minutes = {pid: 0.0 for pid in team_slots if pid not in absent}
+        for index in range(TOTAL_SLOTS):
+            slot = _slot_key(index)
+            weights = {}
+            for pid, slots in team_slots.items():
+                value = float(slots.get(slot, 0))
+                weights[pid] = min(1.0, max(0.0, value)) if math.isfinite(value) else 0.0
+            present = {pid: weights[pid] for pid in minutes}
+            total = sum(present.values())
+            if total > 5:
+                present = {pid: v * 5 / total for pid, v in present.items()}
+            remaining = min(max(0.0, 5 - sum(present.values())),
+                            sum(weights[pid] for pid in absent if pid in weights))
+            for _ in range(len(present) + 1):
+                eligible = {pid: weights[pid] * (1 - value) for pid, value in present.items()
+                            if weights[pid] > 0 and value < 1 - 1e-10}
+                mass = sum(eligible.values())
+                if mass <= 0 or remaining <= 1e-10:
+                    break
+                used = 0.0
+                for pid, w in eligible.items():
+                    delta = min(1 - present[pid], remaining * w / mass)
+                    present[pid] += delta
+                    used += delta
+                remaining -= used
+            for pid, value in present.items():
+                minutes[pid] += value * SLOT_DURATION_MIN
+        return minutes
 
     def _is_next_man_up(
         self,

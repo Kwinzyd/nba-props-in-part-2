@@ -5,6 +5,7 @@ Polls Rotowire Basketball and ESPN NBA RSS every NEWS_POLL_INTERVAL seconds.
 On first poll, silently marks all existing items as seen (no false alerts on restart).
 On subsequent polls, only NEW items matching injury keywords are returned.
 """
+import re
 import feedparser
 from datetime import datetime
 from typing import List, Dict, Set
@@ -26,6 +27,16 @@ INJURY_KEYWORDS = {
 }
 
 
+def mentions(text_lower: str, phrase: str) -> bool:
+    """Whole-word match, so 'out' doesn't fire on 'checking out' or 'about'."""
+    return phrase in text_lower and re.search(
+        r'(?<![a-z0-9])' + re.escape(phrase) + r'(?![a-z0-9])', text_lower) is not None
+
+
+def find_players(text_lower: str, names) -> List[str]:
+    return [n for n in names if mentions(text_lower, n)]
+
+
 class BreakingNewsMonitor:
     def __init__(self):
         self._seen_ids: Set[str] = set()
@@ -37,18 +48,21 @@ class BreakingNewsMonitor:
         """Load full NBA player name set for O(1) mention detection."""
         try:
             from nba_api.stats.static import players
-            return {p['full_name'].lower() for p in players.get_players()}
+            from src.clients.nba_stats import get_current_roster
+            names = {p['full_name'].lower() for p in players.get_players()}
+            # Rookies / new signings aren't in the bundled static list
+            names |= {n.lower() for n in get_current_roster()['id_to_name'].values()}
+            return names
         except Exception:
             return set()
 
     @staticmethod
     def _is_injury_related(title: str, summary: str) -> bool:
         text = (title + ' ' + summary).lower()
-        return any(kw in text for kw in INJURY_KEYWORDS)
+        return any(mentions(text, kw) for kw in INJURY_KEYWORDS)
 
     def _extract_player_names(self, title: str, summary: str) -> List[str]:
-        text = (title + ' ' + summary).lower()
-        return [name for name in self._player_names if name in text]
+        return find_players((title + ' ' + summary).lower(), self._player_names)
 
     def get_breaking_injuries(self) -> List[Dict]:
         """
@@ -73,6 +87,8 @@ class BreakingNewsMonitor:
                     if not self._is_injury_related(title, summary):
                         continue
                     players_found = self._extract_player_names(title, summary)
+                    if not players_found:
+                        continue     # injury words but no NBA player named
                     new_items.append({
                         'player_name':  players_found[0].title() if players_found else '',
                         'all_players':  [p.title() for p in players_found],

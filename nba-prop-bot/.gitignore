@@ -10,3 +10,15 @@ backups/
 deploy/
 out.txt
 scratch/
+
+# Regenerated nightly by train_calibration
+src/models/calibration_market.json
+# full_run.bat output
+logs/
+# Odds API daily credit ledger
+src/data/odds_spend.json
+src/data/telegram_outbox.json
+src/models/**/candidates/
+src/models/*.evaluation.json
+src/models/xgb/*.evaluation.json
+*.promotion.lock

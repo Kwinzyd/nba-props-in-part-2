@@ -22,6 +22,7 @@ Environment:
 """
 
 import os
+import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -39,6 +40,10 @@ logger = get_logger(__name__)
 
 _MIN_EDGE        = float(os.getenv("GAME_ARB_MIN_EDGE",           "0.05"))
 _MAX_ORDERS_DAY  = int(os.getenv("GAME_ARB_MAX_ORDERS_PER_DAY",  "6"))
+# Sharp moneylines are reused for this long. Each refresh costs one Odds API
+# credit per game, and this job runs every 5 minutes (12 games → ~144/hour
+# uncached); Kalshi prices are still checked every run.
+_ODDS_TTL_SEC    = float(os.getenv("GAME_ARB_ODDS_TTL_MIN", "30")) * 60
 
 # Per-star-player-out win probability adjustment
 _INJURY_ADJ_PER_STAR = 0.05
@@ -48,6 +53,8 @@ _TEAM_LOOKUP = TEAM_LOOKUP
 
 # In-process daily order counter
 _orders_today: Dict[str, int] = {}
+# game_id → (fetched_at monotonic, (home_prob, away_prob) or None)
+_sharp_cache: Dict[str, Tuple[float, Optional[Tuple[float, float]]]] = {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -70,6 +77,23 @@ def _get_sharp_probs(
     away_team: str,
     db,
 ) -> Optional[Tuple[float, float]]:
+    """_fetch_sharp_probs, cached per game for GAME_ARB_ODDS_TTL_MIN."""
+    now = time.monotonic()
+    cached = _sharp_cache.get(game_id)
+    if cached and now - cached[0] < _ODDS_TTL_SEC:
+        return cached[1]
+    probs = _fetch_sharp_probs(odds_client, game_id, home_team, away_team, db)
+    _sharp_cache[game_id] = (now, probs)
+    return probs
+
+
+def _fetch_sharp_probs(
+    odds_client: OddsApiClient,
+    game_id: str,
+    home_team: str,
+    away_team: str,
+    db,
+) -> Optional[Tuple[float, float]]:
     """
     Fetch h2h moneyline from the sharpest available book and return
     devigged (home_prob, away_prob).
@@ -84,7 +108,7 @@ def _get_sharp_probs(
             sr_client = SportradarClient()
             data = sr_client.get_event_odds_oddsapi_format(game_id)
         else:
-            data = odds_client.get_event_odds(game_id, markets=["h2h"])
+            data = odds_client.get_event_odds(game_id, markets=["h2h"], caller='game_arb')
     except OddsApiQuotaError:
         logger.warning(f"game_arb: Odds API out of credits for {game_id}. Falling back to Sportradar.")
         with db.get_conn() as conn:

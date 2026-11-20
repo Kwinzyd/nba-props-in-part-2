@@ -32,7 +32,7 @@ from typing import List, Dict, Optional, Tuple
 
 from src.utils.logging_utils import get_logger
 from src.data.db import get_db_client
-from src.clients.nba_stats import NbaStatsClient
+from src.clients.nba_stats import NbaStatsClient, get_completed_seasons
 from src.clients.telegram_bot import TelegramBotClient
 from src.models.projections import build_player_projection, get_market_col
 from src.models.distributions import get_probability_distribution
@@ -47,8 +47,6 @@ _MARKET_COL = {
     'player_threes':   'FG3M',
 }
 
-# Seasons to backtest (most recent first)
-_DEFAULT_SEASONS = ['2024-25', '2023-24', '2022-23']
 
 _MIN_HISTORY_GAMES = 15   # need this many prior games to simulate a bet
 _LINE_WINDOW       = 10   # rolling average window used as the simulated line
@@ -156,7 +154,7 @@ def run_backtest(seasons: Optional[List[str]] = None) -> Dict:
     Inserts all results into backtest_results table.
     """
     if seasons is None:
-        seasons = _DEFAULT_SEASONS[:_N_SEASONS]
+        seasons = get_completed_seasons(_N_SEASONS)
 
     db     = get_db_client()
     stats  = NbaStatsClient()

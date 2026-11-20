@@ -11,13 +11,16 @@ import time
 from src.data.db import get_db_client
 from src.clients.bdl_client import BDLClient
 from src.clients.bdl_game_logs import BDLGameLogs
+from src.clients.nba_stats import get_current_nba_season
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
 # BDL is GOAT tier (600 rpm).
-# Historical seasons to back-populate
-SEASONS = [2022, 2023, 2024, 2025]
+# Historical seasons to back-populate: the in-progress season plus the four
+# before it (BDL keys seasons by start year, so 2026 = 2026-27).
+_CUR = int(get_current_nba_season().split('-')[0])
+SEASONS = list(range(_CUR - 4, _CUR + 1))
 
 def run_ingestion():
     bdl = BDLClient()
