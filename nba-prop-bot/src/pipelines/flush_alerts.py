@@ -31,6 +31,10 @@ def flush_pending_alerts(db: DatabaseClient, bot: TelegramBotClient) -> int:
     Returns the number of alerts included in the digest (0 = nothing sent).
     """
     rows = db.get_pending_alerts(unsent_only=True)
+    # Prop recommendations now use expiring instant delivery. Legacy queued
+    # text has neither a verifiable current price nor an expiry; preserve it
+    # for audit, but never present it again as a current recommendation.
+    rows = [row for row in rows if row['alert_type'] != 'prop']
     if not rows:
         logger.info("flush_pending_alerts: nothing to send.")
         return 0

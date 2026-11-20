@@ -10,8 +10,8 @@ Alarm logic:
   • If rolling_500 Brier is > (all_time_mean + 1.5 × all_time_std) → WARNING.
   • If either alarm fires AND enough data exists → trigger an immediate retrain.
 
-The model probability is reconstructed as: model_prob = edge + 1.0/odds
-(the same formula used in train_calibration.py:57).  Pushes are excluded.
+Uses the calibrated probability stored with each alert, falling back to
+edge + 1.0/odds for legacy rows. Pushes are excluded.
 
 Per-market Brier is also computed for any market with ≥30 settled bets, giving
 early warning of market-specific degradation (e.g. assists model going stale).
@@ -50,7 +50,7 @@ def _fetch_settled(db: DatabaseClient, limit: Optional[int] = None,
                    market: str = None) -> List[Tuple[float, int]]:
     """
     Return [(model_prob, won)] from settled non-push alerts, newest-first.
-    model_prob = edge + 1/odds  (reconstructed; same as train_calibration.py).
+    Prefer stored model_prob; reconstruct edge + 1/odds for legacy rows.
     """
     where_clauses = ["b.push = FALSE", "b.won IS NOT NULL", "a.odds > 1.0"]
     if market:
@@ -58,7 +58,7 @@ def _fetch_settled(db: DatabaseClient, limit: Optional[int] = None,
     where = " AND ".join(where_clauses)
 
     sql = f"""
-        SELECT COALESCE(a.raw_model_prob, a.edge + 1.0 / a.odds) AS model_prob,
+        SELECT COALESCE(a.model_prob, a.edge + 1.0 / a.odds) AS model_prob,
                CAST(b.won AS INTEGER)   AS outcome
         FROM alerts_sent a
         JOIN bet_results b ON a.id = b.alert_id
@@ -87,7 +87,8 @@ def _historical_brier_stats(db: DatabaseClient) -> Tuple[float, float, int]:
     with db.get_conn() as conn:
         rows = conn.execute(
             """SELECT brier FROM model_health
-               WHERE window = 'all_time' AND market = 'all'
+               WHERE "window" = 'all_time' AND market = 'all'
+                 AND snapshot_date < CURRENT_DATE
                ORDER BY snapshot_date DESC
                LIMIT 90"""
         ).fetchall()
@@ -106,9 +107,12 @@ def _write_snapshot(db: DatabaseClient, window: str, market: str,
     today = datetime.now().strftime('%Y-%m-%d')
     with db.get_conn() as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO model_health
-                   (snapshot_date, window, market, brier, n_samples)
-               VALUES (?, ?, ?, ?, ?)""",
+            """INSERT INTO model_health
+                   (snapshot_date, "window", market, brier, n_samples)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT (snapshot_date, "window", market) DO UPDATE SET
+                   brier = excluded.brier, n_samples = excluded.n_samples,
+                   recorded_at = CURRENT_TIMESTAMP""",
             (today, window, market, brier, n),
         )
 
@@ -223,7 +227,7 @@ def check_drift(bot=None) -> Dict:
             f"Per-market Brier:\n{mkt_lines}"
         )
         if alarm:
-            msg += "\n\n<b>Auto-retrain triggered.</b>"
+            msg += "\n\n<b>Review model calibration and retraining settings.</b>"
         logger.warning(f"Drift {level}: σ_100={sigma_100:.2f}  σ_500={sigma_500:.2f}")
         if bot:
             try:

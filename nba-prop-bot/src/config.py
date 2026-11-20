@@ -39,6 +39,10 @@ GAME_MARKETS_ENABLED = os.getenv("GAME_MARKETS_ENABLED", "false").lower() in ("t
 # injury news. Keep it above SCAN_INTERVAL_MINUTES so every game gets a scan
 # inside the window.
 ALERT_LEAD_HOURS = float(os.getenv("ALERT_LEAD_HOURS", "3"))
+# Maximum age of a final prop quote observation (and source update if supplied).
+MAX_PRICE_AGE_SECONDS = float(os.getenv("MAX_PRICE_AGE_SECONDS", "120"))
+MODEL_SHADOW_ENABLED = os.getenv('MODEL_SHADOW_ENABLED', 'true').lower() in ('true', '1', 'yes')
+MODEL_SHADOW_AUTO_PROMOTE = os.getenv('MODEL_SHADOW_AUTO_PROMOTE', 'true').lower() in ('true', '1', 'yes')
 # Overs went 21-38 (hit 36% vs 51% implied) through 2026-10-26 while unders
 # beat the market; off until the model's overs prove out.
 OVERS_ENABLED = os.getenv("OVERS_ENABLED", "false").lower() in ("true", "1", "yes")

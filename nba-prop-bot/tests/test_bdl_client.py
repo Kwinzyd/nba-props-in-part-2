@@ -185,11 +185,7 @@ def _make_bridge(active_players=None, extract_props=None) -> BDLBridge:
     bdl = MagicMock()
     bdl.get_active_players.return_value = active_players or []
     bdl.extract_props_for_scan.return_value = extract_props or []
-    bridge = BDLBridge.__new__(BDLBridge)
-    bridge.bdl = bdl
-    bridge._player_cache = {}
-    bridge._team_cache = {}
-    return bridge
+    return BDLBridge(bdl)
 
 
 # ── BDLBridge.get_props_for_game tests ───────────────────────────────────────

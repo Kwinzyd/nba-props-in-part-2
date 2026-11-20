@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import pandas as pd
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from typing import Dict, Optional
 from src.config import DB_PATH
@@ -170,6 +171,8 @@ class DatabaseClient:
         (24, "clv_tracking: close_book",    "ALTER TABLE clv_tracking ADD COLUMN close_book TEXT"),
         (25, "clv_tracking: close_fair_prob", "ALTER TABLE clv_tracking ADD COLUMN close_fair_prob REAL"),
         (26, "clv_tracking: clv_novig",     "ALTER TABLE clv_tracking ADD COLUMN clv_novig REAL"),
+        (27, "bdl cache: personal fouls", "ALTER TABLE bdl_game_log_cache ADD COLUMN pf REAL"),
+        (28, "bdl cache: season type", "ALTER TABLE bdl_game_log_cache ADD COLUMN season_id TEXT"),
     ]
 
     def _migrate_schema(self, conn):
@@ -243,7 +246,8 @@ class DatabaseClient:
                                  edge: float, book: str, odds: float, stake: float,
                                  game_date: str, event_id: str, home_away: str, rest_days: int,
                                  max_daily_risk: float, max_per_game_risk: float,
-                                 raw_model_prob: float = None, model_prob: float = None) -> Optional[int]:
+                                 raw_model_prob: float = None, model_prob: float = None,
+                                 expires_at=None) -> Optional[int]:
         """
         Atomic check-and-insert: only inserts if the new stake won't exceed
         daily or per-game risk limits. Returns the new alert_id or None.
@@ -271,6 +275,8 @@ class DatabaseClient:
                     return None
 
             # 3. All OK -> Insert
+            if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
+                return None
             cursor.execute(
                 """
                 INSERT INTO alerts_sent
@@ -303,7 +309,7 @@ class DatabaseClient:
                 SELECT edge FROM alerts_sent
                 WHERE player_name = ? AND market = ? AND side = ?
                 AND abs(line - ?) <= 0.5
-                AND timestamp >= NOW() - INTERVAL '12 hours'
+                AND timestamp >= datetime('now', '-12 hours')
                 ORDER BY timestamp DESC LIMIT 1
                 """,
                 (player_name, market, side, line)
@@ -1487,6 +1493,9 @@ class DatabaseClient:
                          log.get('tov', 0), log.get('team_abbr', ''),
                          log.get('matchup', ''), log.get('wl', ''), now)
                     )
+                    conn.execute('UPDATE bdl_game_log_cache SET pf = ?, season_id = ? '
+                                 'WHERE player_id = ? AND season = ? AND game_date = ?',
+                                 (log.get('pf'), log.get('season_id'), player_id, season, log.get('game_date', '')))
                 except Exception:
                     pass
     def get_cached_bdl_game_logs(self, player_id: int, season: int, ignore_ttl: bool = False) -> list:

@@ -20,6 +20,7 @@ from src.clients.bdl_client import BDLClient
 from src.clients.bdl_game_logs import _parse_minutes
 from src.clients.telegram_bot import TelegramBotClient
 from src.pipelines.shadow_overs import PAPER_TABLES, settle_shadow_picks, unsettled_shadow_dates
+from src.pipelines.shadow_validation import pending_dates as validation_dates, settle_predictions
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -240,19 +241,20 @@ def settle_alerts(target_date: Optional[str] = None) -> None:
             """
             SELECT a.id, a.player_name, a.market, a.line, a.side,
                    a.odds, a.stake,
-                   COALESCE(a.game_date::DATE, a.timestamp::DATE) AS game_date,
+                   COALESCE(DATE(a.game_date), DATE(a.timestamp)) AS game_date,
                    a.event_id
             FROM   alerts_sent a
             LEFT   JOIN bet_results b ON a.id = b.alert_id
             WHERE  b.alert_id IS NULL
-              AND  COALESCE(a.game_date::DATE, a.timestamp::DATE) = %s
+              AND  COALESCE(DATE(a.game_date), DATE(a.timestamp)) = ?
             ORDER  BY a.id
             """,
             (target_date,),
         ).fetchall()
 
     paper_pending = [t for t in PAPER_TABLES if unsettled_shadow_dates(db, target_date, target_date, table=t)]
-    if not rows and not paper_pending:
+    validation_pending = validation_dates(db, target_date, target_date)
+    if not rows and not paper_pending and not validation_pending:
         logger.info(f"No unsettled bets for {target_date} — nothing to do.")
         return
 
@@ -276,6 +278,12 @@ def settle_alerts(target_date: Optional[str] = None) -> None:
 
     stat_index = _build_stat_index(final_stats)
     game_index = _build_game_index(final_games)
+    if validation_pending:
+        try:
+            graded = settle_predictions(db, target_date, final_games, final_stats)
+            logger.info('Prospective validation: %s predictions settled for %s', graded, target_date)
+        except Exception as exc:
+            logger.warning('Prospective settlement failed: %s', exc)
 
     logger.info(
         f"BDL: {len(final_games)} final game(s), "
@@ -440,11 +448,11 @@ def settle_recent(days: int = 4) -> None:
     with db.get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT DISTINCT COALESCE(a.game_date::DATE, a.timestamp::DATE) AS game_date
+            SELECT DISTINCT COALESCE(DATE(a.game_date), DATE(a.timestamp)) AS game_date
             FROM   alerts_sent a
             LEFT   JOIN bet_results b ON a.id = b.alert_id
             WHERE  b.alert_id IS NULL
-              AND  COALESCE(a.game_date::DATE, a.timestamp::DATE) BETWEEN %s AND %s
+              AND  COALESCE(DATE(a.game_date), DATE(a.timestamp)) BETWEEN ? AND ?
             ORDER  BY 1
             """,
             (start, yesterday),
@@ -454,6 +462,7 @@ def settle_recent(days: int = 4) -> None:
              for r in rows}
     for table in PAPER_TABLES:
         dates.update(unsettled_shadow_dates(db, start, yesterday, table=table))
+    dates.update(validation_dates(db, end=yesterday))
     for d in sorted(dates):
         settle_alerts(target_date=d)
 

@@ -44,6 +44,12 @@ def main():
     cal_parser = subparsers.add_parser("calibration", help="Check probability calibration and Brier score")
     tune_parser = subparsers.add_parser("tune", help="Run hyperparameter tuning grid search")
     train_parser = subparsers.add_parser("train", help="Train multi-season ML models")
+    promote_parser = subparsers.add_parser("promote", help="Evaluate prospective paired predictions and promote a staged candidate")
+    promote_parser.add_argument('--manifest', required=True)
+    promote_parser.add_argument('--observations', required=True, help='JSON array of recorded pregame predictions and settled outcomes')
+    subparsers.add_parser('shadow_stage', help='Stage initial rate candidates from cached box scores only')
+    subparsers.add_parser('shadow_status', help='Show prospective model experiment progress')
+    subparsers.add_parser('shadow_evaluate', help='Evaluate complete prospective cohorts using the promotion gate')
     
     # Phase 5 Commands
     market_stats_parser = subparsers.add_parser("market_stats", help="Show market micro-structure analytics and biases")
@@ -66,6 +72,33 @@ def main():
         from src.utils.logging_utils import enable_file_logging
         print(f"Logging to {enable_file_logging()}")
 
+    if args.command in ('shadow_stage', 'shadow_status', 'shadow_evaluate'):
+        import json
+        from src.data.db import get_db_client
+        from src.pipelines.shadow_validation import stage_cached_candidates, experiments, evaluate_experiments
+        db = get_db_client()
+        if args.command == 'shadow_stage':
+            print(json.dumps(stage_cached_candidates(db), indent=2))
+        elif args.command == 'shadow_evaluate':
+            print(json.dumps(evaluate_experiments(db), indent=2))
+        else:
+            experiments(db)
+            with db.get_conn() as conn:
+                rows = conn.execute('SELECT e.experiment_id, e.active_path, e.status, e.report, '
+                    'COUNT(p.prediction_id) AS predictions, COUNT(r.prediction_id) AS settled '
+                    'FROM model_shadow_experiments e LEFT JOIN model_shadow_predictions p ON p.experiment_id = e.experiment_id '
+                    'LEFT JOIN model_shadow_results r ON r.prediction_id = p.prediction_id '
+                    'GROUP BY e.experiment_id, e.active_path, e.status, e.report').fetchall()
+            print(json.dumps([dict(r) for r in rows], indent=2, default=str))
+        return
+    if args.command == "promote":
+        import json
+        from pathlib import Path
+        from src.models.model_validation import promote_candidate
+        rows = json.loads(Path(args.observations).read_text(encoding='utf-8'))
+        result = promote_candidate(args.manifest, rows)
+        print(json.dumps(result, indent=2))
+        return
     if args.command == "run":
         from src.pipelines.run_scheduler import start_scheduler
         start_scheduler()

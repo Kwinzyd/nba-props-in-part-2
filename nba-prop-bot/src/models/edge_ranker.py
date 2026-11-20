@@ -140,12 +140,9 @@ def rank_edges(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Filter and rank prop candidates.
 
-    edge         = model_prob - devigged implied prob (what the edge floors use)
-    edge_vs_be   = model_prob - 1/odds, the edge over the price actually paid;
-                   the sort key. Ranking on `edge` let the vig itself count as
-                   edge, so high-hold markets (0.5-line steals/blocks) floated
-                   to the top, and the old ev/(mean*1.25) key favoured
-                   low-count props outright.
+    edge and edge_vs_breakeven use model_prob - 1/odds, with injury penalties.
+    Floors and ranking both use the price actually paid. fair_market_edge
+    retains the separate comparison against devigged market probability.
 
     A candidate is dropped when the devigged sharp consensus says its side is
     below break-even at our price — the sharp market disagrees, so there is no
@@ -157,9 +154,9 @@ def rank_edges(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ranked = []
 
     for c in candidates:
-        model_prob   = c.get('model_prob',  0)
-        implied_prob = c.get('implied_prob', 0)
-        odds         = c.get('odds',        0)
+        model_prob   = float(c.get('model_prob',  0))
+        implied_prob = float(c.get('implied_prob', 0))
+        odds         = float(c.get('odds',        0))
         proj_mins    = c.get('projected_minutes', 0)
         status       = (c.get('injury_status') or 'healthy').lower()
         raw_market   = c.get('market', '')
@@ -180,7 +177,8 @@ def rank_edges(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if sharp_fair < breakeven:
                 continue
 
-        edge = model_prob - implied_prob
+        c['fair_market_edge'] = model_prob - implied_prob
+        edge = model_prob - breakeven
         edge_vs_be = model_prob - breakeven
         ev = model_prob * odds - 1.0
 

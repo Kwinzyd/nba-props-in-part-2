@@ -568,6 +568,7 @@ class BDLClient:
                     "book": vendor,
                     "decimal_odds": self.american_to_decimal(over_odds),
                     "american_odds": over_odds,
+                    "updated_at": prop.get('updated_at'),
                     "vendor": vendor,
                 })
             if under_odds is not None:
@@ -579,6 +580,7 @@ class BDLClient:
                     "book": vendor,
                     "decimal_odds": self.american_to_decimal(under_odds),
                     "american_odds": under_odds,
+                    "updated_at": prop.get('updated_at'),
                     "vendor": vendor,
                 })
 

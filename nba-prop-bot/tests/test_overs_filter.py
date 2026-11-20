@@ -6,9 +6,9 @@ import src.pipelines.scan_props as sp
 def _cands():
     return [
         {'player_id': 'A', 'market': 'player_points', 'side': 'OVER', 'edge': 0.12,
-         'edge_min_applied': 0.08, 'hours_to_tipoff': 1.0, 'odds': 1.9},
+         'edge_min_applied': 0.08, 'hours_to_tipoff': 1.0, 'odds': 1.9, 'model_prob': 0.65, 'line': 20.5},
         {'player_id': 'B', 'market': 'player_points', 'side': 'UNDER', 'edge': 0.12,
-         'edge_min_applied': 0.08, 'hours_to_tipoff': 1.0, 'odds': 1.9},
+         'edge_min_applied': 0.08, 'hours_to_tipoff': 1.0, 'odds': 1.9, 'model_prob': 0.65, 'line': 20.5},
     ]
 
 

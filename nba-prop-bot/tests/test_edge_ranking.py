@@ -56,7 +56,8 @@ def test_ranked_by_edge_vs_breakeven_not_vig():
     fair_line = _candidate(player='Points', model_prob=0.60, implied_prob=0.52, odds=1.91)
     ranked = rank_edges([high_hold, fair_line])
     assert ranked[0]['player_id'] == 'Points'
-    assert ranked[1]['edge'] > ranked[0]['edge']      # floors still see the old edge
+    assert ranked[1]['edge'] < ranked[0]['edge']      # floors use the price paid
+    assert ranked[1]['fair_market_edge'] > ranked[0]['fair_market_edge']
 
 
 def test_low_mean_props_not_favoured():

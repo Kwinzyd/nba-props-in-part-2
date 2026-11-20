@@ -547,6 +547,11 @@ CREATE TABLE IF NOT EXISTS scan_candidates (
 
 -- Sharp Alerts: rec-book prices beating the devigged sharp consensus
 -- (src/pipelines/sharp_picks.py). Paper-tracked and graded, no stakes.
+CREATE TABLE IF NOT EXISTS selection_rejections (
+    event_id TEXT, player_name TEXT, market TEXT, side TEXT, book TEXT,
+    reason TEXT NOT NULL, recorded_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS sharp_picks (
     id              BIGSERIAL PRIMARY KEY,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
@@ -568,3 +573,78 @@ CREATE TABLE IF NOT EXISTS sharp_picks (
     settled_at      TIMESTAMPTZ,
     UNIQUE (game_date, player_name, market, line, side)
 );
+
+-- Sharp line-disagreement alerts: one per player per day (dedup across scans).
+CREATE TABLE IF NOT EXISTS line_disagreement_alerts (
+    id          BIGSERIAL PRIMARY KEY,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    game_date   TEXT NOT NULL,
+    event_id    TEXT,
+    player_name TEXT NOT NULL,
+    market      TEXT NOT NULL,
+    book        TEXT,
+    line        REAL NOT NULL,
+    side        TEXT NOT NULL,
+    odds        REAL,
+    sharp_book  TEXT,
+    sharp_line  REAL,
+    UNIQUE (game_date, player_name)
+);
+
+
+-- Prospective model validation: inputs/predictions never change after recording.
+CREATE TABLE IF NOT EXISTS model_shadow_contexts (context_id TEXT PRIMARY KEY, manifest TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS model_shadow_experiments (
+    experiment_id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL,
+    active_path TEXT NOT NULL,
+    manifest_path TEXT NOT NULL,
+    context_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'collecting',
+    report TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS model_shadow_predictions (
+    prediction_id TEXT PRIMARY KEY,
+    experiment_id TEXT NOT NULL REFERENCES model_shadow_experiments(experiment_id),
+    game_date TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    player_name TEXT NOT NULL,
+    market TEXT NOT NULL,
+    line REAL NOT NULL,
+    side TEXT NOT NULL,
+    snapshot_payload TEXT NOT NULL,
+    snapshot_hash TEXT NOT NULL,
+    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(experiment_id, event_id, player_name, market, line, side)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_prediction_dates ON model_shadow_predictions(game_date);
+CREATE TABLE IF NOT EXISTS model_shadow_results (
+    prediction_id TEXT PRIMARY KEY REFERENCES model_shadow_predictions(prediction_id),
+    actual_result REAL NOT NULL,
+    won BOOLEAN NOT NULL,
+    push BOOLEAN NOT NULL,
+    settled_at TEXT NOT NULL
+);
+
+CREATE OR REPLACE FUNCTION reject_shadow_record_changes() RETURNS TRIGGER AS $$
+BEGIN RAISE EXCEPTION 'Prospective validation records are immutable'; END;
+$$ LANGUAGE plpgsql;
+
+DO $$ BEGIN
+IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'immutable_model_shadow_predictions' AND tgrelid = 'model_shadow_predictions'::regclass) THEN
+CREATE TRIGGER immutable_model_shadow_predictions BEFORE UPDATE OR DELETE ON model_shadow_predictions
+FOR EACH ROW EXECUTE FUNCTION reject_shadow_record_changes();
+END IF; END $$;
+
+DO $$ BEGIN
+IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'immutable_model_shadow_results' AND tgrelid = 'model_shadow_results'::regclass) THEN
+CREATE TRIGGER immutable_model_shadow_results BEFORE UPDATE OR DELETE ON model_shadow_results
+FOR EACH ROW EXECUTE FUNCTION reject_shadow_record_changes();
+END IF; END $$;
+
+DO $$ BEGIN
+IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'immutable_model_shadow_contexts' AND tgrelid = 'model_shadow_contexts'::regclass) THEN
+CREATE TRIGGER immutable_model_shadow_contexts BEFORE UPDATE OR DELETE ON model_shadow_contexts
+FOR EACH ROW EXECUTE FUNCTION reject_shadow_record_changes();
+END IF; END $$;

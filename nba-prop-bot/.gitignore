@@ -18,3 +18,7 @@ logs/
 # Odds API daily credit ledger
 src/data/odds_spend.json
 src/data/telegram_outbox.json
+src/models/**/candidates/
+src/models/*.evaluation.json
+src/models/xgb/*.evaluation.json
+*.promotion.lock

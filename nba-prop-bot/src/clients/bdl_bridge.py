@@ -123,6 +123,7 @@ class BDLBridge:
         prices_by_market: Dict[str, Dict[str, set]] = {}
         best_odds: Dict[tuple, dict] = {}
         line_records: List[tuple] = []
+        quotes: Dict[tuple, dict] = {}
         player_id_map: Dict[str, int] = {}
 
         # We need player names — resolve from BDL player cache
@@ -144,6 +145,8 @@ class BDLBridge:
             side = prop["side"]
             book = prop["book"]
             price = prop["decimal_odds"]
+            quotes[(name, market, line, side, book.lower())] = {
+                'price': price, 'book': book, 'updated_at': prop.get('updated_at')}
 
             players_in_event.add(name)
             player_id_map[name] = pid
@@ -167,6 +170,7 @@ class BDLBridge:
             "prices_by_market": prices_by_market,
             "best_odds": best_odds,
             "line_records": line_records,
+            "quotes": quotes,
             "player_id_map": player_id_map,
         }
 

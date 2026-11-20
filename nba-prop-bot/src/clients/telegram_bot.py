@@ -69,23 +69,25 @@ class TelegramBotClient:
         self.base_url = f"https://api.telegram.org/bot{self.token}"
 
     @retry_with_backoff(retries=3, backoff_in_seconds=2)
-    def send_instant(self, text: str, parse_mode: str = "HTML") -> bool:
+    def send_instant(self, text: str, parse_mode: str = "HTML", expires_at=None) -> bool:
         """
         Tier 1: send immediately.  Use for time-sensitive, expiry-critical alerts.
         """
+        if expires_at is not None and time.time() >= expires_at:
+            return False
         if not self.token or not self.chat_id:
             logger.warning("Telegram credentials missing. Skipping alert.")
             return False
 
         if time.time() - _last_failure < _FAIL_COOLDOWN_SEC:
-            self._enqueue(text, parse_mode)
+            self._enqueue(text, parse_mode, expires_at)
             return False
 
         ok, retryable, why = self._post(text, parse_mode)
         if ok:
             return True
         if retryable:
-            self._enqueue(text, parse_mode)
+            self._enqueue(text, parse_mode, expires_at)
             logger.warning(f"Telegram send failed ({why}) — queued for retry.")
         else:
             logger.warning(f"Telegram rejected message ({why}) — not retried.")
@@ -109,10 +111,11 @@ class TelegramBotClient:
             _last_failure = time.time()
         return False, retryable, f"HTTP {response.status_code}: {response.text[:150]}"
 
-    def _enqueue(self, text: str, parse_mode: str) -> None:
+    def _enqueue(self, text: str, parse_mode: str, expires_at=None) -> None:
         with _outbox_lock:
             items = _load_outbox()
-            items.append({"queued_at": time.time(), "text": text, "parse_mode": parse_mode})
+            items.append({"queued_at": time.time(), "text": text, "parse_mode": parse_mode,
+                          "expires_at": expires_at})
             _save_outbox(items)
 
     def flush_outbox(self) -> int:
@@ -128,11 +131,15 @@ class TelegramBotClient:
             if not items:
                 return 0
             now = time.time()
-            fresh = [m for m in items if now - m["queued_at"] < _OUTBOX_MAX_AGE_SEC]
+            fresh = [m for m in items if now - m["queued_at"] < _OUTBOX_MAX_AGE_SEC
+                     and (m.get('expires_at') is None or now < m['expires_at'])]
             if len(fresh) < len(items):
                 logger.warning(f"Telegram outbox: dropped {len(items) - len(fresh)} stale message(s).")
             sent = 0
             for m in fresh:
+                if m.get('expires_at') is not None and time.time() >= m['expires_at']:
+                    m['done'] = True
+                    continue
                 stamp = datetime.fromtimestamp(m["queued_at"]).strftime('%I:%M %p').lstrip('0')
                 note = f"⏳ Delayed — queued {stamp}"
                 prefix = f"<i>{note}</i>\n" if m.get("parse_mode") == "HTML" else f"{note}\n"
@@ -154,7 +161,7 @@ class TelegramBotClient:
         """Backward-compatible alias for send_instant."""
         return self.send_instant(text, parse_mode=parse_mode)
 
-    def broadcast(self, text: str, db=None, parse_mode: str = "HTML") -> int:
+    def broadcast(self, text: str, db=None, parse_mode: str = "HTML", expires_at=None) -> int:
         """
         Send `text` to all active subscribers in the `subscribers` table.
         Uses asyncio and aiohttp to send concurrently, strictly rate-limited
@@ -163,6 +170,8 @@ class TelegramBotClient:
         Returns the number of successful sends.
         """
         chat_ids: list[str] = []
+        if expires_at is not None and time.time() >= expires_at:
+            return 0
         if db is not None:
             try:
                 with db.get_conn() as conn:
@@ -175,12 +184,14 @@ class TelegramBotClient:
 
         if not chat_ids:
             # Fallback: deliver to the configured single chat_id.
-            return 1 if self.send_instant(text, parse_mode=parse_mode) else 0
+            return 1 if self.send_instant(text, parse_mode=parse_mode, expires_at=expires_at) else 0
 
         import asyncio
         import aiohttp
 
         async def _send_batch(session, url, batch, payload_template):
+            if expires_at is not None and time.time() >= expires_at:
+                return 0
             tasks = []
             for cid in batch:
                 payload = payload_template.copy()

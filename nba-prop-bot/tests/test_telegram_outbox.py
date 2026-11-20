@@ -74,3 +74,18 @@ def test_stale_messages_dropped(bot):
     bot.mode = 'ok'
     assert bot.flush_outbox() == 0
     assert tb.outbox_size() == 0 and bot.sent == []
+
+
+def test_expired_prop_is_never_sent_or_enqueued(bot):
+    assert bot.send_instant('old prop', expires_at=time.time() - 1) is False
+    assert tb.outbox_size() == 0 and bot.sent == []
+
+
+def test_queued_prop_expires_before_outbox_flush(bot):
+    bot.send_instant('prop', expires_at=time.time() + 60)
+    items = tb._load_outbox()
+    items[0]['expires_at'] = time.time() - 1
+    tb._save_outbox(items)
+    bot.mode = 'ok'
+    assert bot.flush_outbox() == 0
+    assert tb.outbox_size() == 0 and bot.sent == []

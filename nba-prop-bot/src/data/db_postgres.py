@@ -30,6 +30,9 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+from src.data.sql_utils import split_schema_sql as _split_schema_sql
+
+
 def _to_py(v):
     """
     Coerce numpy scalar types to native Python so psycopg2 can serialize them.
@@ -186,11 +189,6 @@ class PostgresDatabaseClient:
         with open(schema_path, 'r') as f:
             schema_sql = f.read()
 
-        # Strip all single-line comments (-- ...) before splitting by semicolon
-        # to avoid splitting on semicolons found inside comments.
-        import re
-        schema_sql = re.sub(r'--.*', '', schema_sql)
-
         # Run in autocommit mode — PostgreSQL DDL is transactional but
         # TimescaleDB create_hypertable requires its own transaction context.
         raw = self._pool.getconn()
@@ -200,7 +198,7 @@ class PostgresDatabaseClient:
             # Fail a DDL statement rather than wait forever behind a long transaction.
             cur.execute("SET lock_timeout = '10s'")
 
-            for stmt in schema_sql.split(';'):
+            for stmt in _split_schema_sql(schema_sql):
                 clean_stmt = stmt.strip()
                 if clean_stmt:
                     try:
@@ -230,6 +228,8 @@ class PostgresDatabaseClient:
                 "ALTER TABLE clv_tracking ADD COLUMN IF NOT EXISTS close_book TEXT",
                 "ALTER TABLE clv_tracking ADD COLUMN IF NOT EXISTS close_fair_prob REAL",
                 "ALTER TABLE clv_tracking ADD COLUMN IF NOT EXISTS clv_novig REAL",
+                "ALTER TABLE bdl_game_log_cache ADD COLUMN IF NOT EXISTS pf REAL",
+                "ALTER TABLE bdl_game_log_cache ADD COLUMN IF NOT EXISTS season_id TEXT",
             ]
             for _m in _migrations:
                 try:
@@ -309,12 +309,16 @@ class PostgresDatabaseClient:
                                  max_daily_risk: float = 1000.0,
                                  max_per_game_risk: float = 400.0,
                                  raw_model_prob: float = None,
-                                 model_prob: float = None) -> Optional[int]:
-        """Atomic check-and-insert for PostgreSQL."""
+                                 model_prob: float = None, expires_at=None) -> Optional[int]:
+        """Serialize risk checks across PostgreSQL alert writers."""
         line, edge, odds, stake = _to_py(line), _to_py(edge), _to_py(odds), _to_py(stake)
         raw_model_prob = _to_py(raw_model_prob) if raw_model_prob is not None else None
         model_prob = _to_py(model_prob) if model_prob is not None else None
         with self.get_conn() as conn:
+            # A single INSERT ... SELECT is not sufficient: concurrent
+            # transactions can both read the same remaining risk allowance.
+            # Take a shared transaction lock before acquiring the risk snapshot.
+            conn.execute("SELECT pg_advisory_xact_lock(7261948301)")
             cur = conn.execute(
                 """
                 WITH daily_risk AS (
@@ -333,12 +337,13 @@ class PostgresDatabaseClient:
                 SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 WHERE (SELECT total FROM daily_risk) + %s <= %s
                   AND (SELECT total FROM game_risk) + %s <= %s
+                  AND clock_timestamp() < COALESCE(%s::timestamptz, 'infinity'::timestamptz)
                 RETURNING id
                 """,
                 (event_id, player_name, market, line, side, edge, book, odds, stake,
                  game_date, event_id, home_away, rest_days, raw_model_prob, model_prob,
                  stake, max_daily_risk,
-                 stake, max_per_game_risk)
+                 stake, max_per_game_risk, expires_at)
             )
             row = cur.fetchone()
             if not row:
@@ -1337,6 +1342,7 @@ class PostgresDatabaseClient:
                              team_abbr, matchup, wl, cached_at)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (player_id, season, game_date) DO UPDATE SET
+                              game_id   = EXCLUDED.game_id,
                             min       = EXCLUDED.min,
                             pts       = EXCLUDED.pts,
                             reb       = EXCLUDED.reb,
@@ -1361,6 +1367,9 @@ class PostgresDatabaseClient:
                          log.get('tov', 0), log.get('team_abbr', ''),
                          log.get('matchup', ''), log.get('wl', ''), now),
                     )
+                    conn.execute('UPDATE bdl_game_log_cache SET pf = ?, season_id = ? '
+                                 'WHERE player_id = ? AND season = ? AND game_date = ?',
+                                 (log.get('pf'), log.get('season_id'), player_id, season, log.get('game_date', '')))
                 except Exception:
                     pass
 

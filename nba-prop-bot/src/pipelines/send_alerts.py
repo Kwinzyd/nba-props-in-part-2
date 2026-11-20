@@ -1,4 +1,5 @@
-from math import prod
+from math import prod, isfinite
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
 from src.utils.logging_utils import get_logger
 from src.clients.telegram_bot import TelegramBotClient
@@ -6,9 +7,10 @@ from src.data.db import DatabaseClient, get_db_client
 from src.clients.sportradar_client import SportradarClient
 from src.config import (
     BANKROLL, KELLY_FRACTION, ELIMINATION_MODE, ELIMINATION_KELLY_MULT, GAME_MARKETS_ENABLED,
-    DAILY_RISK_PCT, GAME_RISK_PCT, MAX_BET_PCT, STAKE_MODE, FLAT_STAKE_PCT,
+    DAILY_RISK_PCT, GAME_RISK_PCT, MAX_BET_PCT, STAKE_MODE, FLAT_STAKE_PCT, MAX_PRICE_AGE_SECONDS,
 )
 from src.execution.executor import record_execution
+from src.pipelines.selection_guard import value_rejection, timing_rejection, quote_rejection, reject, utc_time
 
 logger = get_logger(__name__)
 
@@ -56,7 +58,7 @@ def _parlay_kelly_stake(
 
     stake = BANKROLL * (ev / (combined_decimal - 1)) * effective_kelly
     stake = min(stake, BANKROLL * max_pct)
-    return _camouflage_stake(stake)
+    return min(_camouflage_stake(stake), stake)
 
 
 def _camouflage_stake(stake: float) -> float:
@@ -72,10 +74,18 @@ def _camouflage_stake(stake: float) -> float:
 
 def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: TelegramBotClient,
                        game_risk_cap: Optional[float] = None,
-                       daily_risk_cap: Optional[float] = None):
+                       daily_risk_cap: Optional[float] = None, refresh_quote=None):
     """game_risk_cap / daily_risk_cap: tighter ceilings for this call (the
     scan's per-game fair share, and the daily budget minus shares reserved
     for later games); Kelly sizing still scales against MAX_PER_GAME."""
+    reason = value_rejection(edge_data) or timing_rejection(edge_data)
+    if reason:
+        reject(edge_data, db, reason)
+        return
+    for key in ('model_prob', 'odds', 'line'):
+        edge_data[key] = float(edge_data[key])
+    # Recompute from the price/probability pair. Never trust a cached EV field.
+    edge_data['ev'] = float(edge_data['model_prob']) * float(edge_data['odds']) - 1.0
     player    = edge_data.get('player_id', 'Unknown')
     market    = edge_data.get('market',    'Unknown')
     line      = edge_data.get('line',      0.0)
@@ -99,6 +109,9 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
 
     MAX_DAILY_RISK = BANKROLL * DAILY_RISK_PCT
     MAX_PER_GAME   = BANKROLL * GAME_RISK_PCT
+    if not isfinite(MAX_PER_GAME) or MAX_PER_GAME <= 0:
+        reject(edge_data, db, 'invalid_risk_limit')
+        return
 
     current_daily_risk = 0.0
     current_game_risk = 0.0
@@ -107,8 +120,9 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
         cursor = conn.cursor()
 
         # Daily total risk check
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=12)
         cursor.execute(
-            "SELECT SUM(stake) as total_risk FROM alerts_sent WHERE timestamp >= NOW() - INTERVAL '12 hours'"
+            "SELECT SUM(stake) as total_risk FROM alerts_sent WHERE timestamp >= ?", (cutoff,)
         )
         row = cursor.fetchone()
         current_daily_risk = float(row['total_risk'] or 0.0) if row else 0.0
@@ -117,8 +131,8 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
         if event_id:
             cursor.execute(
                 "SELECT SUM(stake) as game_risk FROM alerts_sent "
-                "WHERE event_id = ? AND timestamp >= NOW() - INTERVAL '12 hours'",
-                (event_id,),
+                "WHERE event_id = ? AND timestamp >= ?",
+                (event_id, cutoff),
             )
             game_row = cursor.fetchone()
             current_game_risk = float(game_row['game_risk'] or 0.0) if game_row else 0.0
@@ -147,9 +161,32 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
         else:
             stake = BANKROLL * (ev / (odds - 1.0)) * dynamic_kelly
         stake = min(stake, BANKROLL * MAX_BET_PCT)  # hard cap per bet
-    stake = _camouflage_stake(stake)
+    stake = min(_camouflage_stake(stake), stake)
+
+    if not isfinite(stake) or stake <= 0:
+        reject(edge_data, db, 'nonpositive_stake')
+        return
+    if ((daily_risk_cap is not None and (not isfinite(daily_risk_cap) or daily_risk_cap <= 0))
+            or (game_risk_cap is not None and (not isfinite(game_risk_cap) or game_risk_cap <= 0))):
+        reject(edge_data, db, 'risk_limit')
+        return
+
+    # Refresh only after cheap validity/deduplication/sizing checks. If the
+    # price changes, defer to a later scan so calibration/ranking use that price.
+    try:
+        quote = refresh_quote(edge_data) if refresh_quote else None
+    except Exception:
+        quote = None
+    reason = timing_rejection(edge_data) or quote_rejection(edge_data, quote)
+    if reason:
+        reject(edge_data, db, reason)
+        return
 
     # ── Final Risk Guard & Persist ────────────────────────────────────────────
+    expires_at = min(utc_time(edge_data['commence_time']),
+                     utc_time(quote['checked_at']) + timedelta(seconds=MAX_PRICE_AGE_SECONDS))
+    if quote.get('updated_at'):
+        expires_at = min(expires_at, utc_time(quote['updated_at']) + timedelta(seconds=MAX_PRICE_AGE_SECONDS))
     # Atomic check-and-insert avoids double-spending risk limit in concurrent threads.
     alert_id = db.insert_alert_with_limits(
         player_name=player,
@@ -165,12 +202,14 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
         home_away=home_away,
         rest_days=rest_days,
         max_daily_risk=min(MAX_DAILY_RISK, daily_risk_cap) if daily_risk_cap is not None else MAX_DAILY_RISK,
-        max_per_game_risk=min(MAX_PER_GAME, game_risk_cap) if game_risk_cap else MAX_PER_GAME,
+        max_per_game_risk=min(MAX_PER_GAME, game_risk_cap) if game_risk_cap is not None else MAX_PER_GAME,
         raw_model_prob=raw_model_prob,
         model_prob=model_prob_val,
+        expires_at=expires_at,
     )
 
     if not alert_id:
+        reject(edge_data, db, timing_rejection(edge_data) or quote_rejection(edge_data, quote) or 'risk_limit')
         logger.warning(f"Skipping {player} — daily or per-game risk limit reached.")
         return
 
@@ -203,7 +242,7 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
             f"@ {edge_data['line_shift_sharp_book']}\n"
             if edge_data.get('line_shift_flag') else ""
         )
-        + f"\n<b>Suggested Stake ({'Flat' if STAKE_MODE == 'flat' else 'Kelly'}):</b> ${stake:.0f}"
+        + f"\n<b>Suggested Stake ({'Flat' if STAKE_MODE == 'flat' else 'Kelly'}):</b> ${stake:.2f}"
     )
 
     # Attempt to attach Sportradar Logo
@@ -219,21 +258,33 @@ def evaluate_and_alert(edge_data: Dict[str, Any], db: DatabaseClient, _bot: Tele
     # A failed send lands in the Telegram outbox and is retried (flush_outbox).
     delivered = 0
     try:
-        delivered = _bot.broadcast(msg, db=db)
+        delivered = _bot.broadcast(msg, db=db, expires_at=expires_at.timestamp())
     except Exception as _e:
         logger.warning(f"Telegram broadcast failed (will still queue): {_e}")
 
-    # Tier 2: queue for next digest flush (12 PM / 3 PM / 6 PM).
-    side_char  = 'O' if side.upper() == 'OVER' else 'U'
-    mkt_short  = _MARKET_SHORT.get(market, market[:3].title())
-    title = (
-        f"{player} {side_char}{line} {mkt_short} "
-        f"@{book} {_parlay_american(odds)} | {edge:.1%} | ${stake:.0f}"
-    )
-    db.queue_pending_alert('prop', title, msg, priority=edge, game_date=game_date)
+    # Prop prices expire quickly. Scheduled digests cannot revalidate these
+    # text-only recommendations, so deliver through the expiring instant path.
     logger.info(
-        f"Alert {'sent' if delivered else 'NOT delivered (Telegram outbox)'} + queued: "
+        f"Alert {'sent' if delivered else 'NOT delivered'}: "
         f"{player} {market} {side} {line} @ {book}")
+
+
+def _claim_line_disagreement(db, game_date, event_id, player, market, soft_book,
+                             soft_line, side, soft_odds, sharp_book, sharp_line) -> bool:
+    """Record the day's line-disagreement alert for a player. False if one was already sent."""
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO line_disagreement_alerts
+                (game_date, event_id, player_name, market, book, line, side, odds,
+                 sharp_book, sharp_line)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (game_date, player_name) DO NOTHING
+            """,
+            (game_date, event_id, player, market, soft_book, soft_line, side,
+             soft_odds, sharp_book, sharp_line),
+        )
+        return cur.rowcount > 0
 
 
 def send_line_disagreement_alert(
@@ -250,8 +301,13 @@ def send_line_disagreement_alert(
     """
     line_gap = abs(sharp_line - soft_line)
 
-    # Dedup: don't re-alert on the same disagreement within a scan
-    if db.check_recent_alert(player, market, soft_line, side, edge=0.0):
+    # One line-disagreement alert per player per day, across scans and
+    # restarts. (These were checked against alerts_sent, which they are never
+    # written to, so every scan re-sent them.)
+    if not _claim_line_disagreement(db, game_date, event_id, player, market,
+                                    soft_book, soft_line, side, soft_odds,
+                                    sharp_book, sharp_line):
+        logger.debug(f"Line disagreement already sent today for {player}")
         return
 
     mkt_short = _MARKET_SHORT.get(market, market[:3].title())
@@ -437,7 +493,7 @@ def send_game_market_alert(
     if book_odds > 1.0 and ev > 0.0:
         stake = BANKROLL * (ev / (book_odds - 1.0)) * KELLY_FRACTION
         stake = min(stake, BANKROLL * MAX_BET_PCT)
-    stake = _camouflage_stake(stake)
+    stake = min(_camouflage_stake(stake), stake)
 
     MAX_DAILY_RISK = BANKROLL * DAILY_RISK_PCT
     MAX_PER_GAME   = BANKROLL * GAME_RISK_PCT

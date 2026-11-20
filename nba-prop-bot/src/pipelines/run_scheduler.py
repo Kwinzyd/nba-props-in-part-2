@@ -31,6 +31,7 @@ from src.pipelines.sync_events import sync_events
 from src.pipelines.scan_props import scan_props
 from src.pipelines.update_clv import update_clv_lines
 from src.pipelines.settle_results import settle_recent
+from src.pipelines.shadow_validation import evaluate_experiments
 from src.pipelines.analytics import generate_analytics
 from src.pipelines.calibration import check_calibration
 from src.pipelines.tune import run_tuning
@@ -644,6 +645,12 @@ def job_execution_summary():
 
 
 def job_settle():        notify("Settle",          settle_recent)
+def job_shadow_validation():
+    try:
+        report = evaluate_experiments(get_db_client())
+        logger.info('Prospective model validation: %s', report)
+    except Exception as exc:
+        logger.error('Prospective validation failed closed: %s', exc)
 def job_stats():         notify("Stats",            generate_analytics)
 def job_calibration():   notify("Calibration",      check_calibration)
 def job_tune():          notify("Tune",             run_tuning, get_db_client())
@@ -724,6 +731,7 @@ def start_scheduler():
     daily("04:15", job_sr_audit,          "Sportradar Audit")   # post-game audit
     daily("04:30", job_execution_summary, "Execution Summary")  # paper P&L recap
     daily("05:00", job_drift_monitor,     "Drift Monitor")      # drift check after settlement
+    daily("05:15", job_shadow_validation, "Prospective Validation")
     schedule.every().day.at("09:00").do(job_sync)               # 0 credits (/events is free); sets game count + hibernation
     daily("09:00", sync_sportradar_schedule, "Sportradar Schedule")
     daily("09:05", job_morning_briefing,  "Morning Briefing")   # subscriber daily briefing
@@ -737,7 +745,7 @@ def start_scheduler():
         schedule.every().sunday.at("03:00").do(unless_hibernating(job_train_ml, "Train ML"))  # weekly retrain
         schedule.every(30).days.at("04:00").do(unless_hibernating(job_train_clv_ml, "Train ML [CLV]"))
     else:
-        logger.info("ML auto-retrain off (ML_AUTO_RETRAIN=false) — models change only via `main.py train`.")
+        logger.info("ML candidate training off (ML_AUTO_RETRAIN=false); active replacement requires prospective promotion.")
 
     # --- Game-day guarded jobs (skip when no games or outside window) ---
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(job_scan)  # 1 credit/market/game in SHARP_FETCH_HOURS, cached ODDS_CACHE_MIN

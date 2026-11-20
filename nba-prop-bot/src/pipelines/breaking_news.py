@@ -1,3 +1,7 @@
+from html import escape
+
+from bs4 import BeautifulSoup
+
 from src.clients.telegram_bot import TelegramBotClient
 from src.utils.logging_utils import get_logger
 
@@ -15,11 +19,17 @@ def check_breaking_news(monitor, bot: TelegramBotClient) -> bool:
         return False
 
     for item in items:
+        # RSS summaries contain arbitrary HTML, which Telegram cannot render.
+        # Strip feed markup, then escape all external fields inside our HTML.
+        fields = {
+            key: escape(BeautifulSoup(str(item.get(key, '')), 'html.parser').get_text(' ', strip=True))
+            for key in ('title', 'summary', 'source', 'published_at')
+        }
         source_icon = "🐦" if item['source'].startswith("@") else "📰"
         msg = (
-            f"⚡ <b>BREAKING: {item['title']}</b>\n\n"
-            f"{item['summary']}\n\n"
-            f"{source_icon} {item['source']} · {item['published_at']}\n"
+            f"⚡ <b>BREAKING: {fields['title']}</b>\n\n"
+            f"{fields['summary']}\n\n"
+            f"{source_icon} {fields['source']} · {fields['published_at']}\n"
             f"<i>→ Triggering immediate prop scan...</i>"
         )
         from src.data.db import get_db_client

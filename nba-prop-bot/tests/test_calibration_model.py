@@ -1,6 +1,15 @@
 """Tests for calibration_model.py"""
 
 from src.models.calibration_model import calibrate_prob, calibrate_edge_candidate
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def isolate_model_artifacts(monkeypatch):
+    # Tests of the fallback curve must not load a developer's trained files.
+    import src.models.calibration_model as cm
+    monkeypatch.setattr(cm, '_get_iso_model', lambda: None)
+    monkeypatch.setattr(cm, '_get_anchor', lambda: None)
 
 
 def test_extremes_preserved():

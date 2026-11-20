@@ -7,6 +7,24 @@ from typing import Dict, Optional
 POISSON_MARKETS = {'player_blocks', 'player_steals'}
 
 
+def _outcomes(over, under, push=0.0):
+    """Price conditional on no push; expose stake-return probability separately."""
+    over, under, push = (float(np.clip(v, 0, 1)) for v in (over, under, push))
+    nonpush = over + under
+    p = over / nonpush if nonpush > 1e-12 else 0.5
+    return {'prob_over': p, 'prob_under': 1.0 - p, 'prob_push': push}
+
+
+def _discrete_cdf(cdf, line):
+    lower, upper = np.ceil(line) - 1, np.floor(line)
+    under, inclusive = float(cdf(lower)), float(cdf(upper))
+    return _outcomes(1 - inclusive, under, inclusive - under)
+
+
+def _sample_outcomes(samples, line):
+    return _outcomes(np.mean(samples > line), np.mean(samples < line), np.mean(samples == line))
+
+
 def get_market_col(market: str) -> str:
     market_map = {
         "player_points": "PTS",
@@ -21,21 +39,18 @@ def get_market_col(market: str) -> str:
 
 
 def poisson_over_under(mean: float, line: float) -> Dict[str, float]:
-    if mean <= 0: return {"prob_over": 0.0, "prob_under": 1.0}
-    prob_under = poisson.cdf(np.floor(line), mu=mean)
-    return {"prob_over": 1.0 - prob_under, "prob_under": prob_under}
+    return _discrete_cdf(lambda k: poisson.cdf(k, mu=max(mean, 0)), line)
 
 
 def negative_binomial_over_under(mean: float, variance: float, line: float) -> Dict[str, float]:
-    if mean <= 0: return {"prob_over": 0.0, "prob_under": 1.0}
+    if mean <= 0: return poisson_over_under(0, line)
     if variance <= mean:
         return poisson_over_under(mean, line)
 
     p = mean / variance
     n = (mean ** 2) / (variance - mean)
 
-    prob_under = nbinom.cdf(np.floor(line), n, p)
-    return {"prob_over": 1.0 - prob_under, "prob_under": prob_under}
+    return _discrete_cdf(lambda k: nbinom.cdf(k, n, p), line)
 
 
 def estimate_zero_inflate(logs: pd.DataFrame, col: str) -> float:
@@ -75,22 +90,22 @@ def zip_over_under(mean: float, line: float, zero_inflate: float = 0.0) -> Dict[
     Degenerates to standard Poisson when zero_inflate == 0.
     """
     if mean <= 0:
-        return {"prob_over": 0.0, "prob_under": 1.0}
+        return poisson_over_under(0, line)
     pi  = float(np.clip(zero_inflate, 0.0, 0.50))
     lam = mean / max(1.0 - pi, 0.50)
-    k   = int(np.floor(line))
-    prob_under = pi + (1.0 - pi) * float(poisson.cdf(k, mu=lam))
-    prob_under = float(np.clip(prob_under, 0.0, 1.0))
-    return {"prob_over": 1.0 - prob_under, "prob_under": prob_under}
+    return _discrete_cdf(lambda k: 0.0 if k < 0 else pi + (1 - pi) * poisson.cdf(k, mu=lam), line)
 
 
 def normal_over_under(mean: float, variance: float, line: float) -> Dict[str, float]:
-    if mean <= 0: return {"prob_over": 0.0, "prob_under": 1.0}
-    prob_under = norm.cdf(line, loc=mean, scale=np.sqrt(variance))
-    return {"prob_over": 1.0 - prob_under, "prob_under": prob_under}
+    if mean <= 0: return poisson_over_under(0, line)
+    if variance <= 0: return _sample_outcomes(np.array([round(mean)]), line)
+    # Rounded, zero-truncated-at-observation Normal approximation for counts.
+    cdf = lambda k: 0.0 if k < 0 else norm.cdf(k + 0.5, loc=mean, scale=np.sqrt(variance))
+    return _discrete_cdf(cdf, line)
 
 
-def bootstrap_over_under(logs: pd.DataFrame, col: str, line: float, num_draws: int = 10000) -> Dict[str, float]:
+def bootstrap_over_under(logs: pd.DataFrame, col: str, line: float, num_draws: int = 10000,
+                         mean: Optional[float] = None, variance_scale: float = 1.0) -> Dict[str, float]:
     if logs.empty or len(logs) < 10:
         return {}
 
@@ -102,12 +117,29 @@ def bootstrap_over_under(logs: pd.DataFrame, col: str, line: float, num_draws: i
             return {}
         data = logs[col].values
 
-    if len(data) == 0:
+    data = np.asarray(data, dtype=float)
+    data = data[np.isfinite(data) & (data >= 0)]
+    if len(data) < 10:
         return {}
-
-    draws = np.random.choice(data, size=num_draws, replace=True)
-    prob_over = np.mean(draws > line)
-    return {"prob_over": float(prob_over), "prob_under": float(1.0 - prob_over)}
+    target = float(np.mean(data)) if mean is None else mean
+    # Center residuals on the adjusted mean. Solve the nonnegative location
+    # shift so clipping cannot silently increase expected production.
+    residuals = (data - np.mean(data)) * np.sqrt(variance_scale)
+    lo, hi = -float(np.max(residuals)) - target, target - float(np.min(residuals))
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if np.mean(np.maximum(residuals + mid, 0)) > target:
+            hi = mid
+        else:
+            lo = mid
+    draws = np.maximum(residuals + (lo + hi) / 2, 0)
+    # Analytic randomized rounding preserves the mean and integer support,
+    # without adding random bootstrap noise to the empirical distribution.
+    lower = np.floor(draws)
+    upper = lower + 1
+    weight = draws - lower
+    mass = lambda predicate: np.mean((1 - weight) * predicate(lower) + weight * predicate(upper))
+    return _outcomes(mass(lambda x: x > line), mass(lambda x: x < line), mass(lambda x: x == line))
 
 
 DISPERSION_ALPHAS = {
@@ -159,7 +191,10 @@ def compute_player_foul_rate(logs: pd.DataFrame) -> float:
     """
     if logs.empty or 'PF' not in logs.columns or 'MIN' not in logs.columns:
         return 0.083
-    recent = logs.head(15)
+    recent = logs.head(15).copy()
+    recent['PF'] = pd.to_numeric(recent['PF'], errors='coerce')
+    recent['MIN'] = pd.to_numeric(recent['MIN'], errors='coerce')
+    recent = recent[np.isfinite(recent['PF']) & np.isfinite(recent['MIN']) & (recent['MIN'] > 0) & (recent['PF'] >= 0)]
     total_min = float(recent['MIN'].sum())
     if total_min <= 0:
         return 0.083
@@ -209,6 +244,8 @@ def monte_carlo_over_under(
     playoff_mode: bool = False,
     must_win: bool = False,
     closeout_game: bool = False,
+    variance_scale: float = 1.0,
+    seed: int = 42,
 ) -> Dict[str, float]:
     """
     Vectorized Monte Carlo simulation over n_sims game scenarios.
@@ -246,7 +283,9 @@ def monte_carlo_over_under(
     if proj_minutes <= 0 or mean_proj <= 0:
         return {"prob_over": 0.0, "prob_under": 1.0}
 
-    rng = np.random.default_rng()
+    if not np.isfinite(variance_scale) or variance_scale <= 0:
+        raise ValueError('variance_scale must be positive and finite')
+    rng = np.random.default_rng(seed)
 
     # In the playoffs, coaches leave starters in much longer even in blowouts
     if playoff_mode:
@@ -358,7 +397,7 @@ def monte_carlo_over_under(
     # ── 2. Sample stat outcome (Gamma-Poisson mixture) ─────────────────────
     expected = np.maximum(rate * sim_min, 0.0)
     _alpha_table = DISPERSION_ALPHAS_PLAYOFF if playoff_mode else DISPERSION_ALPHAS
-    alpha = _alpha_table.get(market, 0.10)
+    alpha = _alpha_table.get(market, 0.10) * variance_scale
     # Series-state adjustments. Must-win games compress variance for top
     # minutes — coaches shorten the bench and stars play through contact.
     # Closeout games are more likely to become blowouts, which blows out
@@ -406,8 +445,7 @@ def monte_carlo_over_under(
 
     sampled = np.where(expected > 0.0, rng.poisson(np.maximum(lam, 1e-10)), 0)
 
-    prob_over = float(np.mean(sampled > line))
-    return {"prob_over": prob_over, "prob_under": 1.0 - prob_over}
+    return _sample_outcomes(sampled, line)
 
 
 # ---------------------------------------------------------------------------
@@ -449,14 +487,14 @@ def get_probability_distribution(
     _z = abs(mean - line) / max(mean * 0.3, 1.0) if mean > 0 else 0.0
     _MAX_SINGLE_PROB = min(0.75 + _z * 0.05, 0.93)
 
-    if mean <= 0:
-        return {"prob_over": 0.0, "prob_under": min(1.0, 0.75)}
+    if not all(np.isfinite(v) for v in (mean, line, variance_scale, proj_minutes)) or mean < 0 or line < 0 or variance_scale <= 0:
+        raise ValueError('invalid distribution inputs')
+    if mean == 0:
+        return poisson_over_under(0, line)
 
     def _cap(result: Dict[str, float]) -> Dict[str, float]:
-        return {
-            "prob_over":  min(result["prob_over"],  _MAX_SINGLE_PROB),
-            "prob_under": min(result["prob_under"], _MAX_SINGLE_PROB),
-        }
+        p = float(np.clip(result['prob_over'], 1 - _MAX_SINGLE_PROB, _MAX_SINGLE_PROB))
+        return {**result, 'prob_over': p, 'prob_under': 1 - p}
 
     # Monte Carlo path — engaged when meaningful contextual signals exist
     _use_mc = proj_minutes > 0.0 and (
@@ -480,13 +518,15 @@ def get_probability_distribution(
             playoff_mode=playoff_mode,
             must_win=must_win,
             closeout_game=closeout_game,
+            variance_scale=variance_scale,
         ))
 
     # ── Parametric fallback ─────────────────────────────────────────────────
     if market in ['player_points', 'player_points_rebounds_assists']:
         if logs is not None and not logs.empty:
             col = get_market_col(market)
-            bootstrapped = bootstrap_over_under(logs.head(20), col, line)
+            bootstrapped = bootstrap_over_under(logs.head(20), col, line,
+                                                mean=mean, variance_scale=variance_scale)
             if bootstrapped:
                 return _cap(bootstrapped)
         variance = max(mean * 1.25, 4.0) * variance_scale
